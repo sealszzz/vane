@@ -1,0 +1,386 @@
+name: Vane Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_mode:
+        description: Build and test, or publish a new version
+        type: choice
+        required: true
+        default: build-only
+        options:
+          - build-only
+          - publish
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vane-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - name: Checkout selected commit
+        uses: actions/checkout@v7
+
+      - name: Validate source and release request
+        id: check
+        shell: bash
+        env:
+          RELEASE_MODE: ${{ inputs.release_mode }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          python3 scripts/check-release-consistency.py
+          find scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
+          python3 -m compileall -q scripts tests
+
+          version="$(tr -d '[:space:]' < VERSION)"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "VERSION must contain exactly one x.y.z value" >&2
+            exit 1
+          }
+
+          case "$RELEASE_MODE" in
+            build-only|publish) ;;
+            *) echo "invalid release mode: $RELEASE_MODE" >&2; exit 1 ;;
+          esac
+
+          if [[ "$RELEASE_MODE" != build-only ]]; then
+            [[ -n "$DEFAULT_BRANCH" ]] || {
+              echo "cannot determine the repository default branch" >&2
+              exit 1
+            }
+            [[ "$GITHUB_REF" == "refs/heads/$DEFAULT_BRANCH" ]] || {
+              echo "publishing requires the default branch ($DEFAULT_BRANCH); selected ref: $GITHUB_REF" >&2
+              exit 1
+            }
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  validate:
+    name: Sanitizers (${{ matrix.compiler }})
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc
+            cc: gcc
+          - compiler: clang
+            cc: clang
+    steps:
+      - name: Checkout exact source commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Install validation toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang cmake libjson-c-dev libssl-dev ninja-build \
+            python3 python3-cryptography
+
+      - name: Build and run all sanitizer tests
+        shell: bash
+        env:
+          CC: ${{ matrix.cc }}
+        run: |
+          set -euo pipefail
+          build="$RUNNER_TEMP/sanitize-${{ matrix.compiler }}"
+          cmake -S . -B "$build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DVANE_BUILD_TESTS=ON \
+            -DVANE_CPU_TARGET=baseline \
+            -DVANE_SANITIZE=ON \
+            -DVANE_WERROR=ON
+          cmake --build "$build" --parallel "$(nproc)"
+          ctest --test-dir "$build" --output-on-failure
+
+  prepare:
+    name: Prepare source and dependencies
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      awslc_ref: ${{ steps.resolve.outputs.awslc_ref }}
+      awslc_commit: ${{ steps.resolve.outputs.awslc_commit }}
+      jsonc_ref: ${{ steps.resolve.outputs.jsonc_ref }}
+      jsonc_commit: ${{ steps.resolve.outputs.jsonc_commit }}
+    steps:
+      - name: Checkout exact source commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Create and verify source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/package-source.sh dist
+
+          version='${{ needs.preflight.outputs.version }}'
+          archive="dist/vane-${version}-src.tar.xz"
+          verify="$RUNNER_TEMP/source-verify"
+          mkdir -p "$verify"
+          tar -xJf "$archive" -C "$verify"
+          root="$verify/vane-${version}-src"
+          test -f "$root/VERSION"
+          test ! -e "$root/.git"
+          test "$(tr -d '[:space:]' < "$root/VERSION")" = "$version"
+          python3 "$root/scripts/check-release-consistency.py"
+
+      - name: Resolve dependency tags and commits once
+        id: resolve
+        shell: bash
+        run: scripts/resolve-latest-dependencies.sh "$GITHUB_OUTPUT"
+
+      - name: Upload source archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: vane-source
+          path: dist/vane-*-src.tar.xz
+          if-no-files-found: error
+          retention-days: 30
+
+  build:
+    name: ${{ matrix.name }}
+    needs:
+      - preflight
+      - validate
+      - prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux AMD64-v3
+            target: linux-amd64-v3
+            triple: x86_64-linux-gnu
+            cross: false
+          - name: Linux ARM64
+            target: linux-arm64
+            triple: aarch64-linux-gnu
+            cross: true
+
+    env:
+      AWSLC_REF: ${{ needs.prepare.outputs.awslc_ref }}
+      AWSLC_EXPECTED_COMMIT: ${{ needs.prepare.outputs.awslc_commit }}
+      JSONC_REF: ${{ needs.prepare.outputs.jsonc_ref }}
+      JSONC_EXPECTED_COMMIT: ${{ needs.prepare.outputs.jsonc_commit }}
+      VANE_GIT_COMMIT: ${{ github.sha }}
+
+    steps:
+      - name: Checkout exact source commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Install build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages=(
+            binutils build-essential ca-certificates cmake file git ninja-build
+            patch perl python3 python3-cryptography tar unzip xz-utils
+          )
+
+          if [[ '${{ matrix.cross }}' == true ]]; then
+            packages+=(
+              binutils-aarch64-linux-gnu
+              gcc-aarch64-linux-gnu
+              g++-aarch64-linux-gnu
+              libc6-dev-arm64-cross
+              linux-libc-dev-arm64-cross
+              qemu-user
+            )
+          fi
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "${packages[@]}"
+          cmake --version
+
+      - name: Confirm AMD64-v3 runner
+        if: ${{ matrix.target == 'linux-amd64-v3' }}
+        shell: bash
+        run: scripts/check-x86-64-v3.sh
+
+      - name: Build, test, and verify target
+        shell: bash
+        run: |
+          set -euo pipefail
+          export VANE_DEPS_ROOT="$RUNNER_TEMP/deps-${{ matrix.target }}"
+          scripts/build-release.sh \
+            '${{ matrix.target }}' \
+            "$RUNNER_TEMP/build-${{ matrix.target }}"
+
+      - name: Download exact source archive
+        uses: actions/download-artifact@v8
+        with:
+          name: vane-source
+          # Keep downloaded artifacts outside the Git checkout so the
+          # source-packaging cleanliness gate only observes source changes.
+          path: ../source-dist
+
+      - name: Package and verify stripped payload
+        shell: bash
+        env:
+          STRIP_TOOL: ${{ matrix.triple }}-strip
+        run: |
+          set -euo pipefail
+          version='${{ needs.preflight.outputs.version }}'
+          source_archive="../source-dist/vane-${version}-src.tar.xz"
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          scripts/package-release.sh \
+            '${{ matrix.target }}' \
+            "$RUNNER_TEMP/build-${{ matrix.target }}" \
+            dist \
+            "$source_archive"
+
+          package="dist/vane-${version}-${{ matrix.target }}.tar.xz"
+          scripts/verify-package.sh \
+            "$package" \
+            "$source_archive" \
+            '${{ matrix.target }}' \
+            '${{ github.sha }}'
+
+      - name: Upload binary package
+        uses: actions/upload-artifact@v7
+        with:
+          name: vane-${{ matrix.target }}
+          path: dist/vane-*-${{ matrix.target }}.tar.xz
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: GitHub Release
+    needs:
+      - preflight
+      - build
+    if: ${{ inputs.release_mode == 'publish' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout exact source commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Install verification tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends binutils file xz-utils
+
+      - name: Download binary packages
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: vane-linux-*
+          merge-multiple: true
+
+      - name: Download source archive
+        uses: actions/download-artifact@v8
+        with:
+          name: vane-source
+          path: dist
+
+      - name: Verify assets and create checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          version='${{ needs.preflight.outputs.version }}'
+          source_archive="dist/vane-${version}-src.tar.xz"
+
+          source_check="$RUNNER_TEMP/source-check"
+          mkdir -p "$source_check"
+          scripts/package-source.sh "$source_check"
+          cmp "$source_check/vane-${version}-src.tar.xz" "$source_archive" || {
+            echo "downloaded source archive does not match the selected Git commit" >&2
+            exit 1
+          }
+
+          for target in linux-amd64-v3 linux-arm64; do
+            package="dist/vane-${version}-${target}.tar.xz"
+            scripts/verify-package.sh \
+              "$package" \
+              "$source_archive" \
+              "$target" \
+              '${{ github.sha }}'
+          done
+
+          (
+            cd dist
+            sha256sum \
+              "vane-${version}-linux-amd64-v3.tar.xz" \
+              "vane-${version}-linux-arm64.tar.xz" \
+              "vane-${version}-src.tar.xz" \
+              > "vane-${version}-SHA256SUMS"
+            sha256sum -c "vane-${version}-SHA256SUMS"
+          )
+
+      - name: Create release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_MODE: ${{ inputs.release_mode }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          TAG="v$VERSION"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release already exists: $TAG; refusing to modify published assets" >&2
+            exit 1
+          fi
+
+          # A failed run may already have pushed the immutable tag. Reuse it
+          # only when it resolves to this exact source commit; never move it.
+          tag_refs="$(git ls-remote --tags origin \
+            "refs/tags/$TAG" "refs/tags/$TAG^{}")"
+          remote_commit="$(printf '%s\n' "$tag_refs" \
+            | awk '$2 ~ /\^\{\}$/ {print $1; found=1} END {if (!found) exit 1}' \
+            || printf '%s\n' "$tag_refs" | awk 'NR == 1 {print $1}')"
+          if [[ -n "$remote_commit" ]]; then
+            [[ "$remote_commit" == "$SOURCE_SHA" ]] || {
+              echo "tag $TAG already resolves to $remote_commit, not $SOURCE_SHA" >&2
+              exit 1
+            }
+            echo "reusing immutable tag $TAG at $SOURCE_SHA"
+          else
+            git tag "$TAG" "$SOURCE_SHA"
+            git push origin "refs/tags/$TAG"
+          fi
+
+          : > "$RUNNER_TEMP/EMPTY-RELEASE-NOTES.txt"
+          assets=(
+            "dist/vane-${VERSION}-linux-amd64-v3.tar.xz"
+            "dist/vane-${VERSION}-linux-arm64.tar.xz"
+            "dist/vane-${VERSION}-src.tar.xz"
+            "dist/vane-${VERSION}-SHA256SUMS"
+          )
+
+          gh release create "$TAG" "${assets[@]}" \
+            --verify-tag \
+            --title "$TAG" \
+            --notes-file "$RUNNER_TEMP/EMPTY-RELEASE-NOTES.txt" \
+            --latest

@@ -1,0 +1,83 @@
+{
+  "logging": {
+    "level": "info"
+  },
+  "listeners": [
+    {
+      "transport": "tcp",
+      "address": "[::]:443",
+      "targets": [
+        {
+          "location": "drop",
+          "sni": [
+            "none",
+            "any"
+          ]
+        },
+        {
+          "location": "[::1]:9001",
+          "sni": [
+            "example.com"
+          ],
+          "proxy_protocol": false
+        },
+        {
+          "location": "[::1]:9002",
+          "sni": [
+            "www.example.com"
+          ],
+          "proxy_protocol": false
+        },
+        {
+          "location": "[::1]:9999",
+          "sni": [
+            "*.example.com"
+          ],
+          "proxy_protocol": false
+        },
+        {
+          "location": "[::1]:9009",
+          "proxy_protocol": false
+        }
+      ]
+    },
+    {
+      "transport": "udp",
+      "address": "[::]:443",
+      "targets": [
+        {
+          "location": "drop",
+          "sni": [
+            "none",
+            "any"
+          ]
+        },
+        {
+          "location": "[::1]:9001",
+          "sni": [
+            "example.com"
+          ],
+          "proxy_protocol": false
+        },
+        {
+          "location": "[::1]:9002",
+          "sni": [
+            "www.example.com"
+          ],
+          "proxy_protocol": false
+        },
+        {
+          "location": "[::1]:9999",
+          "sni": [
+            "*.example.com"
+          ],
+          "proxy_protocol": false
+        },
+        {
+          "location": "[::1]:9009",
+          "proxy_protocol": false
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+/build*/
+/.build/
+/.deps/
+/dist/
+*.o
+*.a
+*.so
+*.dSYM/
+__pycache__/
+*.pyc
