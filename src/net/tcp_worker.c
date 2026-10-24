@@ -514,6 +514,37 @@ static bool relay_done(const struct tcp_connection *c) {
            c->c2u.len == 0 && c->u2c.len == 0;
 }
 
+static void flush_relay(struct tcp_worker *worker, uint32_t id) {
+    struct tcp_connection *c = &worker->connections[id];
+    if (c->state != CONN_RELAYING) {
+        (void)refresh_connection(worker, id);
+        return;
+    }
+    bool client_full = c->c2u.len >= c->c2u.max_cap;
+    bool upstream_full = c->u2c.len >= c->u2c.max_cap;
+    if ((c->c2u.len != 0U &&
+         !connection_write(c, &c->c2u, c->upstream_fd)) ||
+        (c->u2c.len != 0U &&
+         !connection_write(c, &c->u2c, c->client_fd))) {
+        close_connection(worker, id);
+        return;
+    }
+    if (c->c2u.len == 0U) c->c2u.max_cap = worker->relay_max;
+    /* A read stopped at the buffer limit, before observing EAGAIN. A direct
+     * write may free space without changing the interest mask. Force MOD in
+     * that case: it rechecks readiness for any unread bytes under EPOLLET. */
+    if (client_full && !c->client_eof && c->c2u.len < c->c2u.max_cap)
+        c->client_events = 0U;
+    if (upstream_full && !c->upstream_eof && c->u2c.len < c->u2c.max_cap)
+        c->upstream_events = 0U;
+    if (!maybe_half_close(c)) {
+        close_connection(worker, id);
+        return;
+    }
+    if (relay_done(c)) close_connection(worker, id);
+    else (void)refresh_connection(worker, id);
+}
+
 static void handle_client_event(struct tcp_worker *worker, uint32_t id,
                                 uint32_t events) {
     struct tcp_connection *c = &worker->connections[id];
@@ -526,17 +557,11 @@ static void handle_client_event(struct tcp_worker *worker, uint32_t id,
             if (!route_probe(worker, id, c->client_eof)) return;
         }
         if ((events & EPOLLERR) != 0) close_connection(worker, id);
-        else if (c->state != CONN_FREE) (void)refresh_connection(worker, id);
+        else if (c->state != CONN_FREE) flush_relay(worker, id);
         return;
     }
     if ((events & EPOLLIN) != 0 && !c->client_eof) {
         if (!connection_read(c, &c->c2u, c->client_fd, &c->client_eof)) {
-            close_connection(worker, id);
-            return;
-        }
-    }
-    if ((events & EPOLLOUT) != 0 && c->u2c.len != 0) {
-        if (!connection_write(c, &c->u2c, c->client_fd)) {
             close_connection(worker, id);
             return;
         }
@@ -551,12 +576,7 @@ static void handle_client_event(struct tcp_worker *worker, uint32_t id,
         close_connection(worker, id);
         return;
     }
-    if (!maybe_half_close(c)) {
-        close_connection(worker, id);
-        return;
-    }
-    if (relay_done(c)) close_connection(worker, id);
-    else (void)refresh_connection(worker, id);
+    flush_relay(worker, id);
 }
 
 static void handle_upstream_event(struct tcp_worker *worker, uint32_t id,
@@ -573,13 +593,6 @@ static void handle_upstream_event(struct tcp_worker *worker, uint32_t id,
             return;
         }
     }
-    if ((events & EPOLLOUT) != 0 && c->c2u.len != 0U) {
-        if (!connection_write(c, &c->c2u, c->upstream_fd)) {
-            close_connection(worker, id);
-            return;
-        }
-        if (c->c2u.len == 0U) c->c2u.max_cap = worker->relay_max;
-    }
     if ((events & (EPOLLRDHUP | EPOLLHUP)) != 0 && !c->upstream_eof) {
         if (!connection_read(c, &c->u2c, c->upstream_fd, &c->upstream_eof)) {
             close_connection(worker, id);
@@ -590,12 +603,7 @@ static void handle_upstream_event(struct tcp_worker *worker, uint32_t id,
         close_connection(worker, id);
         return;
     }
-    if (!maybe_half_close(c)) {
-        close_connection(worker, id);
-        return;
-    }
-    if (relay_done(c)) close_connection(worker, id);
-    else (void)refresh_connection(worker, id);
+    flush_relay(worker, id);
 }
 
 static bool allocate_connection(struct tcp_worker *worker, int client_fd,

@@ -211,71 +211,63 @@ vane_tls_parse_records(const uint8_t *data, size_t len,
     size_t first_record_len = (size_t)((uint16_t)data[3] << 8 | data[4]);
     if (!need(len, TLS_HEADER_LEN, first_record_len)) return VANE_PROBE_NEED_MORE;
 
+    /* Count complete record payloads before allocating. Incomplete fragmented
+     * ClientHellos may be retried on every TCP read; they need no temporary
+     * handshake allocation or repeated clearing of a declared large body. */
     uint8_t header[4];
-    size_t header_len = 0;
-    size_t wire = 0;
-    size_t expected = 0;
-    uint8_t *handshake = NULL;
-    size_t collected = 0;
-    enum vane_probe_result result = VANE_PROBE_NEED_MORE;
-
+    size_t header_len = 0U, wire = 0U, collected = 0U, expected = 0U;
     while (wire < len) {
-        if (!need(len, wire, TLS_HEADER_LEN)) break;
-        if (data[wire] != TLS_CONTENT_HANDSHAKE || data[wire + 1] != 3U ||
-            data[wire + 2] > 4U) {
+        if (!need(len, wire, TLS_HEADER_LEN)) return VANE_PROBE_NEED_MORE;
+        if (data[wire] != TLS_CONTENT_HANDSHAKE || data[wire + 1U] != 3U ||
+            data[wire + 2U] > 4U) {
             vane_error_set(err, "non-handshake TLS record during ClientHello probe");
-            result = VANE_PROBE_MALFORMED;
-            break;
+            return VANE_PROBE_MALFORMED;
         }
-        size_t record_len = (size_t)((uint16_t)data[wire + 3] << 8 | data[wire + 4]);
+        size_t record_len = (size_t)((uint16_t)data[wire + 3U] << 8 |
+                                     data[wire + 4U]);
         wire += TLS_HEADER_LEN;
-        if (!need(len, wire, record_len)) break;
-        size_t rp = 0;
-        while (rp < record_len) {
-            if (header_len < sizeof(header)) {
-                size_t take = VANE_MIN(sizeof(header) - header_len,
-                                         record_len - rp);
-                memcpy(header + header_len, data + wire + rp, take);
-                header_len += take;
-                rp += take;
-                if (header_len < sizeof(header)) continue;
+        if (!need(len, wire, record_len)) return VANE_PROBE_NEED_MORE;
+        if (header_len < sizeof(header)) {
+            size_t take = VANE_MIN(sizeof(header) - header_len, record_len);
+            memcpy(header + header_len, data + wire, take);
+            header_len += take;
+            if (header_len == sizeof(header)) {
                 if (header[0] != TLS_HANDSHAKE_CLIENT_HELLO) {
                     vane_error_set(err, "TLS handshake is not ClientHello");
-                    result = VANE_PROBE_MALFORMED;
-                    goto done;
+                    return VANE_PROBE_MALFORMED;
                 }
                 expected = 4U + ((size_t)header[1] << 16) +
                            ((size_t)header[2] << 8) + header[3];
                 if (expected > VANE_TLS_HANDSHAKE_MAX_SIZE) {
                     vane_error_set(err, "TLS ClientHello exceeds probe limit");
-                    result = VANE_PROBE_MALFORMED;
-                    goto done;
+                    return VANE_PROBE_MALFORMED;
                 }
-                handshake = malloc(expected);
-                if (handshake == NULL) {
-                    vane_error_set(err, "out of memory");
-                    result = VANE_PROBE_MALFORMED;
-                    goto done;
-                }
-                memcpy(handshake, header, sizeof(header));
-                collected = sizeof(header);
-            }
-            size_t missing = expected - collected;
-            size_t take = VANE_MIN(missing, record_len - rp);
-            memcpy(handshake + collected, data + wire + rp, take);
-            collected += take;
-            rp += take;
-            if (collected == expected) {
-                result = vane_tls_parse_handshake(handshake, collected, hello, err);
-                goto done;
             }
         }
+        collected += record_len;
+        wire += record_len;
+        if (expected != 0U && collected >= expected) break;
+    }
+    if (expected == 0U || collected < expected) return VANE_PROBE_NEED_MORE;
+    uint8_t *handshake = malloc(expected);
+    if (handshake == NULL) {
+        vane_error_set(err, "out of memory");
+        return VANE_PROBE_MALFORMED;
+    }
+    size_t copied = 0U;
+    wire = 0U;
+    while (copied < expected) {
+        size_t record_len = (size_t)((uint16_t)data[wire + 3U] << 8 |
+                                     data[wire + 4U]);
+        wire += TLS_HEADER_LEN;
+        size_t take = VANE_MIN(expected - copied, record_len);
+        memcpy(handshake + copied, data + wire, take);
+        copied += take;
         wire += record_len;
     }
-done:
-    if (handshake != NULL) {
-        OPENSSL_cleanse(handshake, expected);
-        free(handshake);
-    }
+    enum vane_probe_result result =
+        vane_tls_parse_handshake(handshake, expected, hello, err);
+    OPENSSL_cleanse(handshake, expected);
+    free(handshake);
     return result;
 }

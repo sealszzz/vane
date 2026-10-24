@@ -221,6 +221,12 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
   endif()
 endif()
 
+add_executable(vane_probe_bench EXCLUDE_FROM_ALL tools/probe_bench.c)
+target_compile_definitions(vane_probe_bench PRIVATE _GNU_SOURCE)
+vane_apply_project_options(vane_probe_bench)
+target_compile_options(vane_probe_bench PRIVATE -UNDEBUG)
+target_link_libraries(vane_probe_bench PRIVATE vane_core)
+
 install(TARGETS vane RUNTIME DESTINATION bin)
 install(FILES configs/vane.json DESTINATION share/vane)
 install(FILES VERSION README.md SECURITY.md CHANGELOG.md BUILDING.md LICENSE
@@ -272,6 +278,10 @@ if(VANE_BUILD_TESTS)
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/tcp_half_close.py
               $<TARGET_FILE:vane>)
     set_tests_properties(tcp_half_close PROPERTIES TIMEOUT 15)
+    add_test(NAME tcp_backpressure
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/tcp_backpressure.py
+              $<TARGET_FILE:vane>)
+    set_tests_properties(tcp_backpressure PROPERTIES TIMEOUT 20)
     add_test(NAME maintenance_regressions
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/maintenance_regressions.py
               $<TARGET_FILE:vane>)
@@ -288,7 +298,7 @@ if(VANE_BUILD_TESTS)
     set_tests_properties(config linux_net tls_parser proxy_protocol route quic_parser parser_robustness udp_flow udp_send udp_receive_error startup_notify sample_config udp_offload
       PROPERTIES ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0:halt_on_error=1;UBSAN_OPTIONS=halt_on_error=1")
     if(Python3_Interpreter_FOUND AND NOT CMAKE_CROSSCOMPILING)
-      set_tests_properties(integration_smoke udp_diagnostics tcp_half_close maintenance_regressions installer_regressions uninstaller_regressions
+      set_tests_properties(integration_smoke udp_diagnostics tcp_half_close tcp_backpressure maintenance_regressions installer_regressions uninstaller_regressions
         PROPERTIES ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0:halt_on_error=1;UBSAN_OPTIONS=halt_on_error=1")
     endif()
   endif()

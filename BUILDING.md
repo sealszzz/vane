@@ -106,7 +106,8 @@ The GitHub workflow separates validation from packaging:
 4. Each release architecture builds AWS-LC, json-c, and Vane from source,
    verifies the CPU flag on their actual compile commands, runs target tests,
    checks ELF hardening and dynamic dependencies, strips the binaries, and
-   repeats process-level tests against the stripped payload.
+   repeats process-level tests, including large TCP backpressure and FIN,
+   against the stripped payload.
 5. Before publication, the release job downloads every archive again, verifies
    its layout, checksums, architecture, embedded source archive, source commit,
    and ELF properties, and then creates the release checksum file.
@@ -137,3 +138,28 @@ After a release build, create a binary archive with the matching source archive:
 ```
 
 Use `linux-arm64` and its corresponding build directory for ARM64.
+
+## Diagnostic comparisons
+
+Build `vane_probe_bench` explicitly to measure two-packet and eight-packet
+ClientHello probe CPU cost using `tests/fixtures`. This diagnostic is not shipped
+as a runtime command:
+
+```sh
+cmake --build build --target vane_probe_bench
+./build/vane_probe_bench tests/fixtures
+```
+
+`tools/relay_bench.py OLD_BINARY NEW_BINARY OUTPUT_JSONL` alternates five local
+TCP ping-pong and bulk comparisons with each Vane instance pinned to one CPU.
+Compile its optional epoll-call counter first:
+
+```sh
+cc -O2 -shared -fPIC tools/epoll_counter.c -ldl -o tools/epoll_counter.so
+python3 tools/relay_bench.py /path/to/old/vane /path/to/new/vane /tmp/relay.jsonl
+```
+
+The counter assumes this single-worker diagnostic only. Instrumented latency
+is not used as a performance result. Python, loopback, host scheduling, and
+kernel offloads limit what these comparisons establish; they are not WAN or
+production-capacity measurements. No absolute speedup is a release gate.

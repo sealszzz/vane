@@ -575,6 +575,7 @@ static int frame_compare(const void *a, const void *b) {
 static enum vane_probe_result reassemble_and_parse(struct crypto_frame *frames,
                                                       size_t count,
                                                       struct vane_client_hello *hello,
+                                                      uint8_t **storage, size_t *storage_cap,
                                                       struct vane_error *err) {
     if (count == 0) return VANE_PROBE_NEED_MORE;
     qsort(frames, count, sizeof(*frames), frame_compare);
@@ -586,19 +587,27 @@ static enum vane_probe_result reassemble_and_parse(struct crypto_frame *frames,
             return VANE_PROBE_MALFORMED;
         }
         size_t end = frames[i].offset + frames[i].len;
-        if (end > stream_len) stream_len = end;
+        /* Sparse far-ahead CRYPTO data does not require a large assembly
+         * allocation until the gap has actually arrived. */
+        if (frames[i].offset <= stream_len && end > stream_len)
+            stream_len = end;
     }
     if (stream_len == 0U) return VANE_PROBE_NEED_MORE;
-    uint8_t *stream = malloc(stream_len);
-    if (stream == NULL) {
-        vane_error_set(err, "out of memory");
-        return VANE_PROBE_MALFORMED;
+    if (stream_len > *storage_cap) {
+        uint8_t *larger = realloc(*storage, stream_len);
+        if (larger == NULL) {
+            vane_error_set(err, "out of memory");
+            return VANE_PROBE_MALFORMED;
+        }
+        *storage = larger;
+        *storage_cap = stream_len;
     }
+    uint8_t *stream = *storage;
     size_t written = 0;
     enum vane_probe_result result = VANE_PROBE_NEED_MORE;
     for (size_t i = 0; i < count; i++) {
         const struct crypto_frame *f = &frames[i];
-        if (f->offset > written) goto done;
+        if (f->offset > written) break;
         if (f->offset < written) {
             size_t overlap = written - f->offset;
             size_t compare_len = VANE_MIN(overlap, f->len);
@@ -614,13 +623,9 @@ static enum vane_probe_result reassemble_and_parse(struct crypto_frame *frames,
             memcpy(stream + written, f->data, f->len);
             written += f->len;
         }
-        result = vane_tls_parse_handshake(stream, written, hello, err);
-        if (result == VANE_PROBE_MATCHED || result == VANE_PROBE_MALFORMED) goto done;
     }
     result = vane_tls_parse_handshake(stream, written, hello, err);
 done:
-    OPENSSL_cleanse(stream, stream_len);
-    free(stream);
     return result;
 }
 
@@ -644,6 +649,11 @@ struct vane_quic_probe_state {
     struct probe_payload *payloads;
     size_t payload_count;
     size_t payload_capacity;
+    struct crypto_frame *frames;
+    size_t frame_count;
+    size_t frame_capacity;
+    uint8_t *stream;
+    size_t stream_capacity;
 };
 
 struct vane_quic_probe_state *vane_quic_probe_state_new(void) {
@@ -666,6 +676,11 @@ void vane_quic_probe_state_free(struct vane_quic_probe_state *state) {
             }
         }
         free(state->payloads);
+    }
+    free(state->frames);
+    if (state->stream != NULL) {
+        OPENSSL_cleanse(state->stream, state->stream_capacity);
+        free(state->stream);
     }
     OPENSSL_cleanse(state, sizeof(*state));
     free(state);
@@ -730,27 +745,6 @@ static bool streaming_append_payload(struct vane_quic_probe_state *state,
     return true;
 }
 
-static enum vane_probe_result
-streaming_parse_payloads(const struct vane_quic_probe_state *state,
-                         struct vane_client_hello *hello,
-                         struct vane_error *err) {
-    struct crypto_frame *frames = NULL;
-    size_t frame_count = 0U, frame_capacity = 0U;
-    bool ok = true;
-    for (size_t i = 0U; i < state->payload_count; i++) {
-        if (!extract_frames(state->payloads[i].data, state->payloads[i].len,
-                            &frames, &frame_count, &frame_capacity, err)) {
-            ok = false;
-            break;
-        }
-    }
-    enum vane_probe_result result = ok
-        ? reassemble_and_parse(frames, frame_count, hello, err)
-        : VANE_PROBE_MALFORMED;
-    free(frames);
-    return result;
-}
-
 enum vane_probe_result
 vane_quic_probe_feed(struct vane_quic_probe_state *state,
                        const uint8_t *datagram, size_t datagram_len,
@@ -798,8 +792,18 @@ vane_quic_probe_feed(struct vane_quic_probe_state *state,
         fresh[i].payload = NULL;
         fresh[i].payload_len = 0U;
     }
+    /* Frame data points into the retained decrypted payloads. Extract only
+     * the newly received packets; previous frames remain valid in state. */
     free(fresh);
-    return streaming_parse_payloads(state, hello, err);
+    for (size_t i = state->payload_count - fresh_count;
+         i < state->payload_count; i++) {
+        if (!extract_frames(state->payloads[i].data, state->payloads[i].len,
+                            &state->frames, &state->frame_count,
+                            &state->frame_capacity, err))
+            return VANE_PROBE_MALFORMED;
+    }
+    return reassemble_and_parse(state->frames, state->frame_count, hello,
+                                &state->stream, &state->stream_capacity, err);
 }
 
 enum vane_probe_result
@@ -845,9 +849,16 @@ vane_quic_parse_client_hello(const struct vane_datagram_view *datagrams,
             break;
         }
     }
+    uint8_t *stream = NULL;
+    size_t stream_capacity = 0U;
     enum vane_probe_result result = ok
-        ? reassemble_and_parse(frames, frame_count, hello, err)
+        ? reassemble_and_parse(frames, frame_count, hello,
+                                &stream, &stream_capacity, err)
         : VANE_PROBE_MALFORMED;
+    if (stream != NULL) {
+        OPENSSL_cleanse(stream, stream_capacity);
+        free(stream);
+    }
     free(frames);
     free_packets(packets, packet_count);
     return result;

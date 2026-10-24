@@ -30,6 +30,11 @@ PROBING -> CONNECTING -> RELAYING -> HALF_CLOSED -> FREE
   descriptors cannot match stale events.
 - Steady-state relay storage is 16 KiB per direction. TLS probing may expand to
   the handshake limit, and the larger allocation is released after draining.
+- After a read or upstream connect completes, buffered relay data is sent
+  immediately in that callback. EPOLLOUT is retained only while data remains.
+  A full read buffer that is drained directly forces an ET readiness recheck,
+  so unread data cannot wait forever for a new edge.
+- Both endpoints share the flush and half-close transition path.
 - Each endpoint caches its current interest mask; `EPOLL_CTL_MOD` is issued only
   when the mask changes.
 - After EOF, the completed read direction is removed from `EPOLLRDHUP` interest
@@ -59,9 +64,12 @@ retried to observe its actual error. `ENOBUFS` is treated as backpressure and is
 not expanded into a retry burst.
 
 Recoverable upstream receive errors do not imply an empty payload queue. The
-worker continues to EAGAIN; after eight recoverable errors in one turn it
-explicitly rearms the socket before yielding, preserving edge-triggered
-progress without requiring another network packet.
+worker continues receiving within the turn budget; after eight recoverable
+errors, 64 successful receive results, or 1 MiB of aggregate payload in one
+turn it explicitly rearms the socket before yielding. The byte budget can
+overshoot by at most one receive buffer. GRO results count as one result, with
+all their original datagrams preserved. This bounds hot-flow occupancy while
+preserving edge-triggered progress without another network packet.
 
 There are no locks, queues, or cross-thread packet handoffs between these
 modules. Release LTO may optimize across translation units.
@@ -147,9 +155,10 @@ reclaimable flow, new flows are rejected and established paths are preserved.
 ## Data paths
 
 Public admission is level-triggered and processed in a bounded quantum per
-event-loop turn. Established upstream sockets remain edge-triggered and drain to
-`EAGAIN`; the admission boundary yields fairly under connection or packet storms
-without adding a rate limiter to established relay traffic.
+event-loop turn. Established upstream sockets remain edge-triggered. Upstream UDP receives
+yield at a bounded quantum and explicitly recheck readiness; TCP reads are
+bounded by their directional buffer. These are scheduling quanta, not sustained
+traffic rate limits. The public boundary also yields under admission storms.
 
 Public to upstream:
 
@@ -181,8 +190,11 @@ Protection keys derived from a QUIC Initial DCID, packet-number reconstruction
 state, and decrypted Initial payloads are retained only for the lifetime of one
 bounded pending probe. Each newly received Initial datagram is decrypted once;
 subsequent datagrams reuse the same protection and packet-number state, while
-CRYPTO frames are reassembled from retained decrypted payloads without re-running
-cryptography over the already buffered datagrams. Client Initial
+CRYPTO frames are extracted only from newly decrypted payloads. Their indexed
+views refer to the retained payloads, and the bounded assembly buffer is reused
+for the contiguous prefix. Known frames are still sorted and copied for each
+feed; this is not a fully incremental QUIC stream receiver. Every contiguous
+overlap in the received batch is checked before ClientHello is accepted. Client Initial
 datagrams smaller than 1200 bytes are rejected before key derivation.
 
 An in-memory flow and its upstream source port disappear after process restart,

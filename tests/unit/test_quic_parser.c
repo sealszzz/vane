@@ -131,8 +131,55 @@ static void test_real_nextquic_initial(void) {
     free(packets[1]);
 }
 
+static void test_overlap_and_fragmentation(void) {
+    struct vane_client_hello hello;
+    struct vane_error err = {0};
+    for (size_t conflict = 0U; conflict < 2U; conflict++) {
+        size_t len;
+        uint8_t *packet = read_fixture(conflict ? "crypto-overlap-conflict.bin"
+                                                : "crypto-overlap-valid.bin", &len);
+        struct vane_datagram_view view = {packet, len};
+        enum vane_probe_result expected = conflict ? VANE_PROBE_MALFORMED
+                                                  : VANE_PROBE_MATCHED;
+        assert(vane_quic_parse_client_hello(&view, 1U, &hello, &err) == expected);
+        struct vane_quic_probe_state *state = vane_quic_probe_state_new();
+        assert(state != NULL);
+        assert(vane_quic_probe_feed(state, packet, len, &hello, &err) == expected);
+        vane_quic_probe_state_free(state);
+        free(packet);
+    }
+    struct vane_datagram_view views[8];
+    uint8_t *packets[8];
+    for (size_t i = 0U; i < 8U; i++) {
+        char name[64];
+        (void)snprintf(name, sizeof(name), "crypto-fragment-%zu.bin", i);
+        size_t len;
+        packets[i] = read_fixture(name, &len);
+        views[i] = (struct vane_datagram_view){packets[i], len};
+    }
+    for (size_t reverse = 0U; reverse < 2U; reverse++) {
+        struct vane_quic_probe_state *state = vane_quic_probe_state_new();
+        assert(state != NULL);
+        for (size_t j = 0U; j < 8U; j++) {
+            size_t i = reverse ? 7U - j : j;
+            enum vane_probe_result expected = j == 7U ? VANE_PROBE_MATCHED
+                                                     : VANE_PROBE_NEED_MORE;
+            assert(vane_quic_probe_feed(state, views[i].data, views[i].len,
+                                        &hello, &err) == expected);
+            if (j == 0U)
+                assert(vane_quic_probe_feed(state, views[i].data, views[i].len,
+                                            &hello, &err) == expected);
+        }
+        assert(strcmp(hello.server_name, "localhost") == 0);
+        vane_quic_probe_state_free(state);
+    }
+    assert(vane_quic_parse_client_hello(views, 8U, &hello, &err) == VANE_PROBE_MATCHED);
+    for (size_t i = 0U; i < 8U; i++) free(packets[i]);
+}
+
 int main(void) {
     test_random_and_truncated();
     test_real_nextquic_initial();
+    test_overlap_and_fragmentation();
     return 0;
 }

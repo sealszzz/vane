@@ -108,6 +108,7 @@ printf '%s\n' "$version_output" | grep -Fqx "cpu $CPU_LEVEL" || fail "stripped b
 VANE_TEST_RUNNER="$TEST_RUNNER" python3 tests/integration/integration_smoke.py "$PACKAGE_ROOT/bin/vane"
 VANE_TEST_RUNNER="$TEST_RUNNER" python3 tests/integration/udp_diagnostics.py "$PACKAGE_ROOT/bin/vane"
 VANE_TEST_RUNNER="$TEST_RUNNER" python3 tests/integration/tcp_half_close.py "$PACKAGE_ROOT/bin/vane"
+VANE_TEST_RUNNER="$TEST_RUNNER" python3 tests/integration/tcp_backpressure.py "$PACKAGE_ROOT/bin/vane"
 VANE_TEST_RUNNER="$TEST_RUNNER" python3 tests/integration/maintenance_regressions.py "$PACKAGE_ROOT/bin/vane"
 if [[ ${#RUNNER[@]} -eq 0 ]]; then
   python3 tests/integration/installer_regressions.py \

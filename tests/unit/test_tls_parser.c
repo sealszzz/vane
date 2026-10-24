@@ -56,6 +56,33 @@ int main(void) {
     assert(vane_tls_parse_records(fragmented, f, &hello, &err) == VANE_PROBE_MATCHED);
     assert(strcmp(hello.server_name, "example.com") == 0);
 
+    for (size_t first = 0U; first < handshake_len; first++) {
+        size_t at = 0U;
+        size_t portions[3] = {first, 1U, handshake_len - first - 1U};
+        size_t source = 5U;
+        for (size_t i = 0U; i < 3U; i++) {
+            size_t n = portions[i];
+            fragmented[at++] = 0x16U;
+            fragmented[at++] = 0x03U;
+            fragmented[at++] = 0x03U;
+            fragmented[at++] = (uint8_t)(n >> 8);
+            fragmented[at++] = (uint8_t)n;
+            memcpy(fragmented + at, wire + source, n);
+            at += n;
+            source += n;
+        }
+        for (size_t partial = 0U; partial < at; partial++) {
+            enum vane_probe_result result =
+                vane_tls_parse_records(fragmented, partial, &hello, &err);
+            /* A zero final record is not needed once the hello is complete. */
+            assert(result == VANE_PROBE_NEED_MORE ||
+                   (portions[2] == 0U && partial >= at - 5U &&
+                    result == VANE_PROBE_MATCHED));
+        }
+        assert(vane_tls_parse_records(fragmented, at, &hello, &err) == VANE_PROBE_MATCHED);
+        assert(strcmp(hello.server_name, "example.com") == 0);
+    }
+
     /* A present server_name extension must contain a non-empty list. */
     uint8_t empty_list[1024];
     memcpy(empty_list, wire, len);

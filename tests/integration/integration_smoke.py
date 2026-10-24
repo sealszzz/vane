@@ -123,7 +123,9 @@ def encode_varint(value: int) -> bytes:
 
 def make_quic_initial(host: str, version: int, *, scid: bytes | None = None,
                       dcid: bytes | None = None,
-                      crypto_limit: int | None = None) -> bytes:
+                      crypto_limit: int | None = None,
+                      crypto_frames: bytes | None = None,
+                      packet_number: int = 0) -> bytes:
     if not HAVE_CRYPTOGRAPHY:
         raise RuntimeError("cryptography is unavailable")
     if version == 1:
@@ -157,10 +159,12 @@ def make_quic_initial(host: str, version: int, *, scid: bytes | None = None,
             raise ValueError("crypto_limit must retain an incomplete TLS handshake")
         crypto = crypto[:crypto_limit]
     frame = b"\x06" + encode_varint(0) + encode_varint(len(crypto)) + crypto
+    if crypto_frames is not None:
+        frame = crypto_frames
     # Exactly 1200 bytes on the wire. The long-header fields below are fixed-size
     # for this fixture, so plaintext length 1156 yields a 1200-byte datagram.
     plaintext = frame + b"\x00" * (1156 - len(frame))
-    pn = 0
+    pn = packet_number
     pn_bytes = pn.to_bytes(2, "big")
     protected_len = len(pn_bytes) + len(plaintext) + 16
     header_without_pn = (

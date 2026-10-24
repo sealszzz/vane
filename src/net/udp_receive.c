@@ -387,12 +387,30 @@ static void note_upstream_quic_retry(struct udp_flow *flow,
     }
 }
 
+static void rearm_upstream(struct udp_worker *worker, size_t id) {
+    struct udp_flow *flow = &worker->flows[id];
+    struct epoll_event event = {
+        .events = EPOLLIN | EPOLLET,
+        .data.u64 = udp_event_token(UDP_EVENT_UPSTREAM,
+            (uint32_t)id, flow->generation),
+    };
+    if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD,
+                  flow->upstream_fd, &event) != 0) {
+        int saved = errno;
+        LOG_WARN("UDP worker %zu flow=%zu upstream rearm failed: %s",
+                 worker->args->worker_index, id, strerror(saved));
+        udp_flow_remove(worker, id);
+    }
+}
+
 void udp_receive_upstream(struct udp_worker *worker, size_t id) {
     struct udp_flow *flow = &worker->flows[id];
     if (flow->state == UDP_FLOW_QUIESCENT && !udp_flow_resume(worker, id))
         return;
     size_t recoverable_errors = 0U;
-    for (;;) {
+    size_t received = 0U, received_bytes = 0U;
+    while (received < UDP_UPSTREAM_RECEIVE_QUANTUM &&
+           received_bytes < UDP_UPSTREAM_RECEIVE_BYTES) {
         uint8_t *buffer = worker->upstream_rx_storage;
         struct vane_udp_meta meta;
         struct vane_error err = {0};
@@ -410,22 +428,13 @@ void udp_receive_upstream(struct udp_worker *worker, size_t id) {
              * Preserve ET readiness until EAGAIN; rearm if errors exhaust the
              * bounded retry budget so no queued response needs a new packet. */
             if (++recoverable_errors >= UDP_RECEIVE_ERROR_QUANTUM) {
-                struct epoll_event event = {
-                    .events = EPOLLIN | EPOLLET,
-                    .data.u64 = udp_event_token(UDP_EVENT_UPSTREAM,
-                        (uint32_t)id, flow->generation),
-                };
-                if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD,
-                              flow->upstream_fd, &event) != 0) {
-                    saved = errno;
-                    LOG_WARN("UDP worker %zu flow=%zu upstream rearm failed: %s",
-                             worker->args->worker_index, id, strerror(saved));
-                    udp_flow_remove(worker, id);
-                }
+                rearm_upstream(worker, id);
                 return;
             }
             continue;
         }
+        received++;
+        received_bytes += (size_t)n;
         udp_flow_clear_error_history(flow);
         flow->last_activity_ms = vane_monotonic_ms();
         bool first_response = !flow->upstream_confirmed;
@@ -448,4 +457,9 @@ void udp_receive_upstream(struct udp_worker *worker, size_t id) {
                              meta.tclass, meta.has_tclass);
         if (worker->down_count == worker->down_capacity) udp_downstream_flush(worker);
     }
+    /* A busy upstream must yield even when it never reaches EAGAIN. MOD
+     * schedules another turn for already queued payload, without requiring
+     * any later packet to create an edge. Flush before servicing other flows. */
+    udp_downstream_flush(worker);
+    rearm_upstream(worker, id);
 }

@@ -2,6 +2,23 @@
 
 ## Current release
 
+- Flush TCP relay data in the current readiness callback; request EPOLLOUT only
+  for queued data, and recheck ET read readiness after draining a full buffer.
+- Share the relay flushing and half-close transition path between endpoints.
+- Bound each upstream UDP receive turn to 64 receive results or 1 MiB and rearm
+  ET readiness before yielding, preserving progress without another packet.
+- Extract only new QUIC CRYPTO frames during a pending probe and reuse its
+  contiguous assembly buffer; sparse gaps do not enlarge that buffer.
+- Validate contiguous overlapping CRYPTO frames before accepting ClientHello.
+- Allocate cross-record TLS assembly only after complete record payloads cover
+  the declared handshake, avoiding repeated allocations on partial input.
+- Add fragmentation, conflicting overlap, ET quantum, and large TCP backpressure
+  regressions, including stripped release and cross-architecture packaging gates.
+- Keep the configuration schema, routing policy, capacity tiers, UDP PROXY v2,
+  installer, uninstaller, and immutable release workflow unchanged.
+
+## Previous maintenance release
+
 - Fixed installation rollback so failures before old files are backed up never
   remove the previous installation; incomplete restores retain their backups.
 - Announce systemd readiness only after every listener worker initializes, and
