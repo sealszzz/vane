@@ -2,6 +2,22 @@
 
 ## Current release
 
+- Preserve TCP ET read progress when a full probe buffer transitions to
+  upstream connect, before PROXY headroom changes the logical buffer limit.
+- Enforce the logical TCP read limit even when an earlier probe allocation
+  is larger, preserving bounded relay work and buffer accounting.
+- Track the first observed server Initial SCID as well as the first Retry
+  SCID, preserving legitimate QUIC v1/v2 Initial continuations on the same
+  upstream socket. Retire both aliases when a new connection takes over.
+- Ignore later conflicting server Initial/Retry CID updates; arbitrary
+  unobserved client DCID changes still require classification.
+- Avoid redundant flow hashing for adjacent equal-key UDP datagrams during
+  worker-local rebatching.
+- Add no-new-write TCP probe-transition tests and process-level QUIC CID
+  continuation tests, including Retry and GRO/rebatch paths.
+
+## Previous maintenance release
+
 - Flush TCP relay data in the current readiness callback; request EPOLLOUT only
   for queued data, and recheck ET read readiness after draining a full buffer.
 - Share the relay flushing and half-close transition path between endpoints.

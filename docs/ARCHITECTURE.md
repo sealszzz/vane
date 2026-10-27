@@ -34,6 +34,8 @@ PROBING -> CONNECTING -> RELAYING -> HALF_CLOSED -> FREE
   immediately in that callback. EPOLLOUT is retained only while data remains.
   A full read buffer that is drained directly forces an ET readiness recheck,
   so unread data cannot wait forever for a new edge.
+- A full probe also forces this recheck before routing changes its buffer
+  limit. Reads respect the logical limit even when the allocation is larger.
 - Both endpoints share the flush and half-close transition path.
 - Each endpoint caches its current interest mask; `EPOLL_CTL_MOD` is issued only
   when the mask changes.
@@ -102,10 +104,12 @@ PENDING -> ACTIVE(unconfirmed) -> ACTIVE(confirmed) -> QUIESCENT
 - Traffic in either direction refreshes `last_activity_ms`. A quiescent flow
   resumes on the same file descriptor.
 - QUIC version plus both connection IDs identify the active Initial context.
-  A server Retry is observed on the upstream path, and only its Source
-  Connection ID is accepted as the next client Initial destination ID. An
-  arbitrary DCID change with a reused client SCID is therefore not mistaken for
-  a Retry continuation.
+  The first server Retry and the first server Initial are observed on the
+  connected upstream path. Their Source Connection IDs are accepted as client
+  Initial destination IDs only with the original client SCID and version.
+  Both aliases remain valid for reordering; later conflicting server updates
+  are ignored. An arbitrary unobserved DCID change still requires a side probe.
+  These observations are routing metadata, not cryptographic authentication.
 - If reprobe selects the current target, the connected upstream socket and
   source port are retained. If it selects a different target, Vane opens,
   configures, connects, and registers the replacement socket before closing the
@@ -116,7 +120,8 @@ PENDING -> ACTIVE(unconfirmed) -> ACTIVE(confirmed) -> QUIESCENT
 - The receive path applies the same decision before ordinary forwarding,
   recvmmsg rebatching, and UDP GRO aggregate forwarding.
 - Each flow remembers up to four replaced Initial identities for two minutes,
-  including an observed Retry continuation when applicable. Recent old Initial
+  including observed Retry and server Initial continuations when applicable.
+  The four-entry bound is shared by all aliases. Recent old Initial
   packets are discarded before they can replace the current route. This bounded
   history is not general anti-replay protection or multi-connection CID routing.
 - A confirmed flow has a rolling 24-hour hard-idle limit, but it may be removed

@@ -176,11 +176,13 @@ static void buffer_init(struct io_buffer *buffer, size_t max_cap,
 static ssize_t buffer_read_from_fd(struct io_buffer *buffer, int fd, bool *eof) {
     ssize_t total = 0;
     for (;;) {
+        /* A probe allocation can outlive a reduction of the logical limit. */
+        if (buffer->len >= buffer->max_cap) return total;
         if (buffer_tail_space(buffer) == 0U) {
-            if (buffer->len >= buffer->max_cap) return total;
             if (!buffer_reserve_tail(buffer, 1U)) { errno = ENOMEM; return -1; }
         }
-        size_t space = buffer_tail_space(buffer);
+        size_t space = VANE_MIN(buffer_tail_space(buffer),
+                                buffer->max_cap - buffer->len);
         if (space == 0U) return total;
         ssize_t n = recv(fd, buffer->data + buffer->off + buffer->len,
                          space, MSG_DONTWAIT);
@@ -380,6 +382,11 @@ static bool begin_connect(struct tcp_worker *worker, uint32_t id,
         close_connection(worker, id);
         return false;
     }
+    /* The probe read may have stopped at its old limit without EAGAIN.
+     * Preserve that fact before adding PROXY headroom changes max_cap;
+     * refresh_connection must recheck any unread client bytes under ET. */
+    if (!c->client_eof && c->c2u.len >= c->c2u.max_cap)
+        c->client_events = 0U;
     c->c2u.max_cap = VANE_MAX(worker->relay_max,
         c->c2u.len + sizeof(struct vane_proxy_header));
     struct vane_error err = {0};

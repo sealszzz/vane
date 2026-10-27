@@ -125,7 +125,10 @@ def make_quic_initial(host: str, version: int, *, scid: bytes | None = None,
                       dcid: bytes | None = None,
                       crypto_limit: int | None = None,
                       crypto_frames: bytes | None = None,
-                      packet_number: int = 0) -> bytes:
+                      packet_number: int = 0,
+                      initial_dcid: bytes | None = None,
+                      server: bool = False,
+                      token: bytes = b"") -> bytes:
     if not HAVE_CRYPTOGRAPHY:
         raise RuntimeError("cryptography is unavailable")
     if version == 1:
@@ -147,8 +150,9 @@ def make_quic_initial(host: str, version: int, *, scid: bytes | None = None,
         scid = bytes.fromhex("0102030405060708")
     if not (0 <= len(dcid) <= 20 and 0 <= len(scid) <= 20):
         raise ValueError("QUIC connection IDs must be at most 20 bytes")
-    initial_secret = hkdf_extract(salt, dcid)
-    client_secret = hkdf_expand(initial_secret, hkdf_label(32, b"client in"), 32)
+    initial_secret = hkdf_extract(salt, dcid if initial_dcid is None else initial_dcid)
+    label = b"server in" if server else b"client in"
+    client_secret = hkdf_expand(initial_secret, hkdf_label(32, label), 32)
     key = hkdf_expand(client_secret, hkdf_label(16, key_label), 16)
     iv = hkdf_expand(client_secret, hkdf_label(12, iv_label), 12)
     hp = hkdf_expand(client_secret, hkdf_label(16, hp_label), 16)
@@ -161,15 +165,16 @@ def make_quic_initial(host: str, version: int, *, scid: bytes | None = None,
     frame = b"\x06" + encode_varint(0) + encode_varint(len(crypto)) + crypto
     if crypto_frames is not None:
         frame = crypto_frames
-    # Exactly 1200 bytes on the wire. The long-header fields below are fixed-size
-    # for this fixture, so plaintext length 1156 yields a 1200-byte datagram.
-    plaintext = frame + b"\x00" * (1156 - len(frame))
+    # The protected-length varint stays two bytes for these fixtures.
+    overhead = (len(dcid) - 8) + (len(scid) - 8)
+    overhead += len(token) + len(encode_varint(len(token))) - 1
+    plaintext = frame + b"\x00" * (1156 - overhead - len(frame))
     pn = packet_number
     pn_bytes = pn.to_bytes(2, "big")
     protected_len = len(pn_bytes) + len(plaintext) + 16
     header_without_pn = (
         bytes([first]) + version_bytes + bytes([len(dcid)]) + dcid +
-        bytes([len(scid)]) + scid + encode_varint(0) + encode_varint(protected_len)
+        bytes([len(scid)]) + scid + encode_varint(len(token)) + token + encode_varint(protected_len)
     )
     aad = header_without_pn + pn_bytes
     nonce = bytearray(iv)

@@ -310,6 +310,63 @@ static void test_event_token_roundtrip(void) {
     assert(udp_token_generation(token) == UINT32_C(0x89abcdef));
 }
 
+static void test_server_initial_identity_tracking(void) {
+    struct udp_flow flow = {0};
+    struct vane_quic_initial_identity client = {
+        .version = 1U, .destination_connection_id = {1U},
+        .destination_connection_id_len = 1U,
+        .source_connection_id = {2U}, .source_connection_id_len = 1U,
+    };
+    struct vane_quic_initial_identity response = {
+        .version = 1U, .destination_connection_id = {2U},
+        .destination_connection_id_len = 1U,
+        .source_connection_id = {3U}, .source_connection_id_len = 1U,
+    };
+    udp_flow_set_quic_identity(&flow, &client);
+    response.version = 2U;
+    udp_flow_note_quic_initial(&flow, &response);
+    assert(!flow.has_quic_server_dcid);
+    response.version = 1U;
+    response.destination_connection_id[0] = 9U;
+    udp_flow_note_quic_initial(&flow, &response);
+    assert(!flow.has_quic_server_dcid);
+    response.destination_connection_id[0] = 2U;
+    udp_flow_note_quic_retry(&flow, &response);
+    struct vane_quic_initial_identity after_retry = client;
+    after_retry.destination_connection_id[0] = 3U;
+    assert(udp_flow_quic_identity_matches(&flow, &after_retry));
+    response.source_connection_id[0] = 4U;
+    udp_flow_note_quic_retry(&flow, &response);
+    assert(flow.quic_retry_dcid[0] == 3U); /* First Retry wins. */
+    udp_flow_note_quic_initial(&flow, &response);
+    struct vane_quic_initial_identity after_initial = client;
+    after_initial.destination_connection_id[0] = 4U;
+    assert(udp_flow_quic_identity_matches(&flow, &after_initial));
+    assert(udp_flow_quic_identity_matches(&flow, &after_retry));
+    assert(udp_flow_quic_identity_matches(&flow, &client));
+    response.source_connection_id[0] = 5U;
+    udp_flow_note_quic_initial(&flow, &response);
+    assert(flow.quic_server_dcid[0] == 4U); /* First Initial wins. */
+    after_initial.source_connection_id[0] = 9U;
+    assert(!udp_flow_quic_identity_matches(&flow, &after_initial));
+    after_initial.source_connection_id[0] = 2U;
+    struct vane_quic_initial_identity replacement = client;
+    replacement.source_connection_id[0] = 6U;
+    udp_flow_set_quic_identity(&flow, &replacement);
+    assert(!flow.has_quic_server_dcid && !flow.has_quic_retry_dcid);
+    uint64_t now = vane_monotonic_ms();
+    assert(udp_flow_quic_identity_retired(&flow, &client, now));
+    assert(udp_flow_quic_identity_retired(&flow, &after_retry, now));
+    assert(udp_flow_quic_identity_retired(&flow, &after_initial, now));
+    /* Zero-length server SCIDs remain distinguishable from unknown SCIDs. */
+    response.destination_connection_id[0] = 6U;
+    response.source_connection_id_len = 0U;
+    udp_flow_note_quic_initial(&flow, &response);
+    replacement.destination_connection_id_len = 0U;
+    assert(udp_flow_quic_identity_matches(&flow, &replacement));
+    udp_flow_set_quic_identity(&flow, NULL);
+    assert(!flow.has_quic_server_dcid);
+}
 
 static void test_udp_error_history_reset_is_explicit(void) {
     struct udp_flow flow = {0};
@@ -358,6 +415,7 @@ static void test_retired_quic_identities(void) {
 }
 
 int main(void) {
+    test_server_initial_identity_tracking();
     test_retired_quic_identities();
     test_udp_error_history_reset_is_explicit();
     assert(udp_next_power_of_two(1U) == 1U);

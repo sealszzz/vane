@@ -236,7 +236,7 @@ install(FILES VERSION README.md SECURITY.md CHANGELOG.md BUILDING.md LICENSE
 
 if(VANE_BUILD_TESTS)
   enable_testing()
-  foreach(test_name IN ITEMS config linux_net tls_parser proxy_protocol route quic_parser parser_robustness udp_flow udp_send udp_receive_error startup_notify)
+  foreach(test_name IN ITEMS config linux_net tls_parser proxy_protocol route quic_parser parser_robustness udp_flow udp_send udp_receive_error startup_notify tcp_progress)
     add_executable(test_${test_name} tests/unit/test_${test_name}.c)
     target_compile_definitions(test_${test_name} PRIVATE
       _GNU_SOURCE _FILE_OFFSET_BITS=64
@@ -286,6 +286,10 @@ if(VANE_BUILD_TESTS)
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/maintenance_regressions.py
               $<TARGET_FILE:vane>)
     set_tests_properties(maintenance_regressions PROPERTIES TIMEOUT 25)
+    add_test(NAME quic_cid_progress
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/quic_cid_progress.py
+              $<TARGET_FILE:vane>)
+    set_tests_properties(quic_cid_progress PROPERTIES TIMEOUT 15)
     add_test(NAME installer_regressions
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/installer_regressions.py
               $<TARGET_FILE:vane>)
@@ -295,10 +299,10 @@ if(VANE_BUILD_TESTS)
     set_tests_properties(uninstaller_regressions PROPERTIES TIMEOUT 20)
   endif()
   if(VANE_SANITIZE)
-    set_tests_properties(config linux_net tls_parser proxy_protocol route quic_parser parser_robustness udp_flow udp_send udp_receive_error startup_notify sample_config udp_offload
+    set_tests_properties(config linux_net tls_parser proxy_protocol route quic_parser parser_robustness udp_flow udp_send udp_receive_error startup_notify tcp_progress sample_config udp_offload
       PROPERTIES ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0:halt_on_error=1;UBSAN_OPTIONS=halt_on_error=1")
     if(Python3_Interpreter_FOUND AND NOT CMAKE_CROSSCOMPILING)
-      set_tests_properties(integration_smoke udp_diagnostics tcp_half_close tcp_backpressure maintenance_regressions installer_regressions uninstaller_regressions
+      set_tests_properties(integration_smoke udp_diagnostics tcp_half_close tcp_backpressure maintenance_regressions quic_cid_progress installer_regressions uninstaller_regressions
         PROPERTIES ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0:halt_on_error=1;UBSAN_OPTIONS=halt_on_error=1")
     endif()
   endif()

@@ -110,6 +110,7 @@ VANE_TEST_RUNNER="$TEST_RUNNER" python3 tests/integration/udp_diagnostics.py "$P
 VANE_TEST_RUNNER="$TEST_RUNNER" python3 tests/integration/tcp_half_close.py "$PACKAGE_ROOT/bin/vane"
 VANE_TEST_RUNNER="$TEST_RUNNER" python3 tests/integration/tcp_backpressure.py "$PACKAGE_ROOT/bin/vane"
 VANE_TEST_RUNNER="$TEST_RUNNER" python3 tests/integration/maintenance_regressions.py "$PACKAGE_ROOT/bin/vane"
+VANE_TEST_RUNNER="$TEST_RUNNER" python3 tests/integration/quic_cid_progress.py "$PACKAGE_ROOT/bin/vane"
 if [[ ${#RUNNER[@]} -eq 0 ]]; then
   python3 tests/integration/installer_regressions.py \
     "$PACKAGE_ROOT/bin/vane"

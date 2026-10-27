@@ -204,11 +204,8 @@ static size_t try_rebatch_public(struct udp_worker *worker, int first, int total
         struct udp_flow_key next_key = {.client = meta.peer,
                                         .local = meta.local};
         if (!udp_flow_key_equal(&key, &next_key)) break;
-        size_t next_id = udp_flow_lookup_id(worker, &next_key);
-        if (next_id != id ||
-            (worker->flows[next_id].state != UDP_FLOW_ACTIVE &&
-             worker->flows[next_id].state != UDP_FLOW_REPROBING))
-            break;
+        /* The identical key still names this flow: this worker owns the
+         * table and collecting views does not mutate it. Avoid rehashing. */
         const uint8_t *packet =
             worker->rx_storage + (size_t)j * UDP_MAX_PACKET;
         if (active_packet_requires_segment_path(worker, flow, packet,
@@ -371,7 +368,7 @@ void udp_receive_public(struct udp_worker *worker) {
     }
 }
 
-static void note_upstream_quic_retry(struct udp_flow *flow,
+static void note_upstream_quic_identity(struct udp_flow *flow,
                                      const uint8_t *data, size_t len,
                                      uint16_t gro_segment_size) {
     size_t segment = gro_segment_size != 0U ? gro_segment_size : len;
@@ -379,10 +376,13 @@ static void note_upstream_quic_retry(struct udp_flow *flow,
     while (offset < len) {
         size_t n = VANE_MIN(segment, len - offset);
         struct vane_quic_initial_identity identity;
-        if (vane_quic_looks_like_retry(data + offset, n) &&
-            vane_quic_read_long_header_identity(data + offset, n,
-                                                  &identity))
-            udp_flow_note_quic_retry(flow, &identity);
+        bool initial = vane_quic_looks_like_initial(data + offset, n);
+        bool retry = vane_quic_looks_like_retry(data + offset, n);
+        if ((initial || retry) &&
+            vane_quic_read_long_header_identity(data + offset, n, &identity)) {
+            if (initial) udp_flow_note_quic_initial(flow, &identity);
+            else udp_flow_note_quic_retry(flow, &identity);
+        }
         offset += n;
     }
 }
@@ -440,7 +440,7 @@ void udp_receive_upstream(struct udp_worker *worker, size_t id) {
         bool first_response = !flow->upstream_confirmed;
         flow->upstream_confirmed = true;
         uint16_t segment = meta.has_gro ? meta.gro_segment_size : 0;
-        note_upstream_quic_retry(flow, buffer, (size_t)n, segment);
+        note_upstream_quic_identity(flow, buffer, (size_t)n, segment);
         if (first_response) {
             char client_buf[96];
             LOG_DEBUG("UDP worker %zu flow=%zu first upstream response client=%s "
