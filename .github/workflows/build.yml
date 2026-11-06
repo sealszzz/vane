@@ -4,13 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       release_mode:
-        description: Build and test, or publish a new version
+        description: Build only, publish a new version, or replace the same version
         type: choice
         required: true
         default: build-only
         options:
           - build-only
           - publish
+          - replace
 
 permissions:
   contents: read
@@ -50,7 +51,7 @@ jobs:
           }
 
           case "$RELEASE_MODE" in
-            build-only|publish) ;;
+            build-only|publish|replace) ;;
             *) echo "invalid release mode: $RELEASE_MODE" >&2; exit 1 ;;
           esac
 
@@ -272,7 +273,7 @@ jobs:
     needs:
       - preflight
       - build
-    if: ${{ inputs.release_mode == 'publish' }}
+    if: ${{ inputs.release_mode != 'build-only' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -337,7 +338,7 @@ jobs:
             sha256sum -c "vane-${version}-SHA256SUMS"
           )
 
-      - name: Create release
+      - name: Publish or replace release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -348,27 +349,45 @@ jobs:
           set -euo pipefail
           TAG="v$VERSION"
 
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "release already exists: $TAG; refusing to modify published assets" >&2
-            exit 1
-          fi
+          case "$RELEASE_MODE" in
+            publish|replace) ;;
+            *) echo "invalid publication mode: $RELEASE_MODE" >&2; exit 1 ;;
+          esac
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
 
-          # A failed run may already have pushed the immutable tag. Reuse it
-          # only when it resolves to this exact source commit; never move it.
+          # API failures must not be mistaken for a missing release.
+          release_id="$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$TAG\") | .id")"
+          [[ -z "$release_id" || "$release_id" =~ ^[0-9]+$ ]]
           tag_refs="$(git ls-remote --tags origin \
             "refs/tags/$TAG" "refs/tags/$TAG^{}")"
-          remote_commit="$(printf '%s\n' "$tag_refs" \
-            | awk '$2 ~ /\^\{\}$/ {print $1; found=1} END {if (!found) exit 1}' \
-            || printf '%s\n' "$tag_refs" | awk 'NR == 1 {print $1}')"
-          if [[ -n "$remote_commit" ]]; then
-            [[ "$remote_commit" == "$SOURCE_SHA" ]] || {
-              echo "tag $TAG already resolves to $remote_commit, not $SOURCE_SHA" >&2
+          remote_oid="$(printf '%s\n' "$tag_refs" | awk -v ref="refs/tags/$TAG" '$2 == ref {print $1}')"
+          peeled_oid="$(printf '%s\n' "$tag_refs" | awk -v ref="refs/tags/$TAG^{}" '$2 == ref {print $1}')"
+          remote_commit="${peeled_oid:-$remote_oid}"
+
+          if [[ "$RELEASE_MODE" == replace ]]; then
+            # All build/package gates have passed. Remove obsolete assets too.
+            if [[ -n "$release_id" ]]; then
+              gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/$release_id"
+            fi
+            git push --force-with-lease="refs/tags/$TAG:$remote_oid" \
+              origin "$SOURCE_SHA:refs/tags/$TAG"
+          else
+            [[ -z "$release_id" ]] || {
+              echo "release already exists: $TAG; use replace to rebuild it" >&2
               exit 1
             }
-            echo "reusing immutable tag $TAG at $SOURCE_SHA"
-          else
-            git tag "$TAG" "$SOURCE_SHA"
-            git push origin "refs/tags/$TAG"
+            if [[ -n "$remote_commit" ]]; then
+              [[ "$remote_commit" == "$SOURCE_SHA" ]] || {
+                echo "tag $TAG already resolves to $remote_commit, not $SOURCE_SHA" >&2
+                exit 1
+              }
+            else
+              git push origin "$SOURCE_SHA:refs/tags/$TAG"
+            fi
           fi
 
           : > "$RUNNER_TEMP/EMPTY-RELEASE-NOTES.txt"

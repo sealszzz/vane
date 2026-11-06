@@ -112,10 +112,13 @@ The GitHub workflow separates validation from packaging:
    its layout, checksums, architecture, embedded source archive, source commit,
    and ELF properties, and then creates the release checksum file.
 
-Publishing is accepted only from the repository's default branch. A tag that
-already points at the selected commit may be reused after an interrupted run,
-but tags are never moved and existing GitHub releases or assets are never
-modified.
+Publishing and replacement require the default branch. `publish` refuses an
+existing release and may reuse an interrupted run's tag only at the same commit.
+`replace` removes the old release and assets after all checks pass, moves the
+tag to the selected commit using an explicit force-with-lease, and recreates
+the release. API errors stop publication. Replacement is not atomic; rerun
+`replace` after a failure. Repository tag rules or immutable-release settings
+may prevent it. Dependency selection remains latest-stable for each run.
 
 A failed validation stage prevents packaging or publication.
 

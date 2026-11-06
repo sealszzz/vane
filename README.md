@@ -136,12 +136,15 @@ To run it from a local development build:
 
 The workflow is triggered manually from **Actions > Vane Build > Run workflow**.
 Select `build-only` to compile, test, and upload temporary workflow artifacts,
-or `publish` to perform the same checks and create a GitHub Release. A normal
-`git push` does not trigger this workflow.
+`publish` to create a new GitHub Release, or `replace` to rebuild the same
+version. A normal `git push` does not trigger this workflow.
 
-Published releases and their tags are immutable. After successfully publishing
-a version, update `VERSION` and the changelog before publishing a different
-build; rerunning `publish` with an existing release tag will be rejected.
+Both publication modes require the default branch and all validation gates.
+`publish` rejects existing releases and conflicting tags. `replace` removes the
+old release and its assets, moves the version tag to the selected commit, and
+publishes both architectures, matching source, and checksums. It does not
+change `VERSION`. Replacement is not atomic; rerun `replace` if publication
+fails. Repository tag protection or immutable releases may block replacement.
 
 ## Documentation
 

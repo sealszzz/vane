@@ -74,12 +74,14 @@ for marker in [
     "scripts/verify-package.sh", "scripts/check-x86-64-v3.sh",
     "DEFAULT_BRANCH", 'refs/heads/$DEFAULT_BRANCH',
     "git ls-remote --tags origin", "release already exists",
+    "build-only|publish|replace", 'git push --force-with-lease=',
+    'gh api --method DELETE',
 ]:
     if marker not in workflow:
         raise SystemExit(f"workflow release marker missing: {marker}")
 for forbidden in [
     "vane-dependencies", "fetch-latest-deps.py",
-    "needs.preflight.outputs.source_commit", "git tag -f", "git push --force",
+    "needs.preflight.outputs.source_commit", "git tag -f", "git push --force ",
     "gh release edit", "--clobber",
 ]:
     if forbidden in workflow:
