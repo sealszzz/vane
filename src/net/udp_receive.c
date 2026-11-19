@@ -293,29 +293,8 @@ static void process_public_aggregate(struct udp_worker *worker,
     }
 }
 
-static void reset_rx_messages(struct udp_worker *worker) {
-    for (size_t i = 0; i < worker->rx_count; i++) {
-        struct mmsghdr *mmsg = &worker->rx_msgs[i];
-        struct iovec *iov = &worker->rx_iov[i];
-        struct sockaddr_storage *peer = &worker->rx_peers[i];
-        unsigned char *control = worker->rx_controls + i * VANE_UDP_CONTROL_SIZE;
-        memset(mmsg, 0, sizeof(*mmsg));
-        memset(peer, 0, sizeof(*peer));
-        memset(control, 0, VANE_UDP_CONTROL_SIZE);
-        iov->iov_base = worker->rx_storage + i * UDP_MAX_PACKET;
-        iov->iov_len = UDP_MAX_PACKET;
-        mmsg->msg_hdr.msg_name = peer;
-        mmsg->msg_hdr.msg_namelen = sizeof(*peer);
-        mmsg->msg_hdr.msg_iov = iov;
-        mmsg->msg_hdr.msg_iovlen = 1;
-        mmsg->msg_hdr.msg_control = control;
-        mmsg->msg_hdr.msg_controllen = VANE_UDP_CONTROL_SIZE;
-    }
-}
-
 void udp_receive_public(struct udp_worker *worker) {
     for (size_t batch = 0U; batch < UDP_PUBLIC_BATCH_QUANTUM; batch++) {
-        reset_rx_messages(worker);
         int n = recvmmsg(worker->public_fd, worker->rx_msgs,
                          (unsigned int)worker->rx_count, MSG_DONTWAIT, NULL);
         if (n < 0) {
@@ -364,6 +343,12 @@ void udp_receive_public(struct udp_worker *worker) {
             process_public_aggregate(worker, &meta, data, mmsg->msg_len);
             i++;
         }
+        /* recvmsg writes only the returned slots. Restore input capacities
+         * after processing; flags and msg_len are kernel outputs. */
+        for (int i = 0; i < n; i++) {
+            worker->rx_msgs[i].msg_hdr.msg_namelen = sizeof(struct sockaddr_storage);
+            worker->rx_msgs[i].msg_hdr.msg_controllen = VANE_UDP_CONTROL_SIZE;
+        }
         if ((size_t)n < worker->rx_count) return;
     }
 }
@@ -411,7 +396,7 @@ void udp_receive_upstream(struct udp_worker *worker, size_t id) {
     size_t received = 0U, received_bytes = 0U;
     while (received < UDP_UPSTREAM_RECEIVE_QUANTUM &&
            received_bytes < UDP_UPSTREAM_RECEIVE_BYTES) {
-        uint8_t *buffer = worker->upstream_rx_storage;
+        uint8_t *buffer = worker->down_storage + worker->down_count * UDP_MAX_PACKET;
         struct vane_udp_meta meta;
         struct vane_error err = {0};
         ssize_t n = vane_udp_recvmsg(flow->upstream_fd, buffer,

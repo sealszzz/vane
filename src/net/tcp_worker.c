@@ -96,10 +96,12 @@ static uint32_t token_generation(uint64_t token) { return (uint32_t)(token >> 24
 static uint32_t token_id(uint64_t token) { return (uint32_t)(token & 0x00ffffffU); }
 
 static enum prefix_class classify_prefix(const struct io_buffer *buffer) {
-    if (buffer->len < 3U) return PREFIX_NEED_MORE;
+    if (buffer->len == 0U) return PREFIX_NEED_MORE;
     const uint8_t *p = buffer->data + buffer->off;
-    return p[0] == 0x16U && p[1] == 0x03U && p[2] <= 0x04U
-        ? PREFIX_TLS_LIKE : PREFIX_NON_TLS;
+    if (p[0] != 0x16U || (buffer->len >= 2U && p[1] != 0x03U))
+        return PREFIX_NON_TLS;
+    if (buffer->len < 3U) return PREFIX_NEED_MORE;
+    return p[2] <= 0x04U ? PREFIX_TLS_LIKE : PREFIX_NON_TLS;
 }
 
 static size_t buffer_tail_space(const struct io_buffer *buffer) {
@@ -567,13 +569,7 @@ static void handle_client_event(struct tcp_worker *worker, uint32_t id,
         else if (c->state != CONN_FREE) flush_relay(worker, id);
         return;
     }
-    if ((events & EPOLLIN) != 0 && !c->client_eof) {
-        if (!connection_read(c, &c->c2u, c->client_fd, &c->client_eof)) {
-            close_connection(worker, id);
-            return;
-        }
-    }
-    if ((events & (EPOLLRDHUP | EPOLLHUP)) != 0 && !c->client_eof) {
+    if ((events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP)) != 0 && !c->client_eof) {
         if (!connection_read(c, &c->c2u, c->client_fd, &c->client_eof)) {
             close_connection(worker, id);
             return;
@@ -594,13 +590,7 @@ static void handle_upstream_event(struct tcp_worker *worker, uint32_t id,
             !finish_connect(worker, id)) return;
     }
     if (c->state != CONN_RELAYING) return;
-    if ((events & EPOLLIN) != 0 && !c->upstream_eof) {
-        if (!connection_read(c, &c->u2c, c->upstream_fd, &c->upstream_eof)) {
-            close_connection(worker, id);
-            return;
-        }
-    }
-    if ((events & (EPOLLRDHUP | EPOLLHUP)) != 0 && !c->upstream_eof) {
+    if ((events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP)) != 0 && !c->upstream_eof) {
         if (!connection_read(c, &c->u2c, c->upstream_fd, &c->upstream_eof)) {
             close_connection(worker, id);
             return;

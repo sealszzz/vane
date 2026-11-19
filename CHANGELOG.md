@@ -2,6 +2,14 @@
 
 ## Current release
 
+- Route short non-TLS TCP prefixes as soon as the available bytes rule out
+  TLS. Read each endpoint once per readiness event, including half-close.
+- Receive upstream UDP data directly into a downstream batch slot, moving
+  only split trains when needed. Reuse public receive descriptors across calls.
+- Parse a single contiguous QUIC CRYPTO frame from the decrypted payload.
+
+## Previous TCP and QUIC routing fixes
+
 - Preserve TCP ET read progress when a full probe buffer transitions to
   upstream connect, before PROXY headroom changes the logical buffer limit.
 - Enforce the logical TCP read limit even when an earlier probe allocation

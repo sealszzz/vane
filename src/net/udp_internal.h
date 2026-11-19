@@ -155,7 +155,6 @@ struct udp_worker {
     size_t down_capacity;
     size_t down_count;
 
-    uint8_t *upstream_rx_storage;
     uint64_t next_expiry_scan_ms;
     uint64_t next_capacity_scan_ms;
 };

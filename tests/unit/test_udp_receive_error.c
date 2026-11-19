@@ -62,10 +62,9 @@ int main(void) {
         .args = &args, .flows = &flow, .flow_capacity = 1U,
         .epoll_fd = epoll_fd, .down_capacity = 3U,
     };
-    worker.upstream_rx_storage = malloc(UDP_MAX_PACKET);
     worker.down_storage = malloc(3U * UDP_MAX_PACKET);
     worker.down = calloc(3U, sizeof(*worker.down));
-    assert(worker.upstream_rx_storage && worker.down_storage && worker.down);
+    assert(worker.down_storage && worker.down);
     udp_receive_upstream(&worker, 0U);
     udp_flow_handle_epoll_error(&worker, 0U, event.events);
     assert(flow.state == UDP_FLOW_ACTIVE);
@@ -135,7 +134,6 @@ int main(void) {
     close(backend);
     close(client);
     close(epoll_fd);
-    free(worker.upstream_rx_storage);
     free(worker.down_storage);
     free(worker.down);
     return 0;

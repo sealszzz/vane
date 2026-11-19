@@ -108,6 +108,22 @@ int main(void) {
     struct vane_worker_args args;
     struct udp_flow flow;
     init_worker(&worker, &args, &flow);
+    /* With a single queue slot, the tail of a split GRO receive has to
+     * survive both the synchronous flush and an in-slot move. */
+    worker.down_capacity = 1U;
+    const size_t stride = 1000U;
+    const size_t train = VANE_MIN(UDP_GSO_SAFE_BYTES / stride,
+                                  (size_t)UDP_GSO_MAX_SEGMENTS) * stride;
+    assert(train + 300U <= UDP_MAX_PACKET);
+    memset(worker.down_storage, 0x42, train);
+    memset(worker.down_storage + train, 0x73, 300U);
+    udp_downstream_queue(&worker, &flow, worker.down_storage, train + 300U,
+                         (uint16_t)stride, 0U, false);
+    assert(delivered == 1U && lengths[0] == train);
+    assert(worker.down_count == 1U && worker.down[0].len == 300U);
+    for (size_t i = 0U; i < 300U; i++) assert(worker.down[0].data[i] == 0x73);
+    udp_downstream_flush(&worker);
+    worker.down_capacity = 16U;
     uint8_t payload[2500] = {0};
 
     reset_sender(GSO_FAIL);

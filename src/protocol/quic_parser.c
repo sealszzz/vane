@@ -578,6 +578,11 @@ static enum vane_probe_result reassemble_and_parse(struct crypto_frame *frames,
                                                       uint8_t **storage, size_t *storage_cap,
                                                       struct vane_error *err) {
     if (count == 0) return VANE_PROBE_NEED_MORE;
+    if (count == 1U) {
+        /* extract_frames has already checked the offset and length. */
+        if (frames[0].offset != 0U) return VANE_PROBE_NEED_MORE;
+        return vane_tls_parse_handshake(frames[0].data, frames[0].len, hello, err);
+    }
     qsort(frames, count, sizeof(*frames), frame_compare);
     size_t stream_len = 0;
     for (size_t i = 0; i < count; i++) {

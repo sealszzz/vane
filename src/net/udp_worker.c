@@ -50,7 +50,6 @@ static bool worker_allocate_storage(struct udp_worker *worker) {
     worker->tx_controls = calloc(worker->down_capacity,
                                  VANE_UDP_CONTROL_SIZE);
     worker->down_storage = malloc(worker->down_capacity * UDP_MAX_PACKET);
-    worker->upstream_rx_storage = malloc(UDP_MAX_PACKET);
 
     return worker->flows != NULL && worker->flow_index != NULL &&
            worker->free_flow_ids != NULL &&
@@ -60,8 +59,24 @@ static bool worker_allocate_storage(struct udp_worker *worker) {
            worker->rx_controls != NULL && worker->rx_storage != NULL &&
            worker->down != NULL && worker->tx_msgs != NULL &&
            worker->tx_iov != NULL && worker->tx_controls != NULL &&
-           worker->down_storage != NULL &&
-           worker->upstream_rx_storage != NULL;
+           worker->down_storage != NULL;
+}
+
+static void init_rx_messages(struct udp_worker *worker) {
+    for (size_t i = 0; i < worker->rx_count; i++) {
+        struct mmsghdr *mmsg = &worker->rx_msgs[i];
+        struct iovec *iov = &worker->rx_iov[i];
+        struct sockaddr_storage *peer = &worker->rx_peers[i];
+        unsigned char *control = worker->rx_controls + i * VANE_UDP_CONTROL_SIZE;
+        iov->iov_base = worker->rx_storage + i * UDP_MAX_PACKET;
+        iov->iov_len = UDP_MAX_PACKET;
+        mmsg->msg_hdr.msg_name = peer;
+        mmsg->msg_hdr.msg_namelen = sizeof(*peer);
+        mmsg->msg_hdr.msg_iov = iov;
+        mmsg->msg_hdr.msg_iovlen = 1;
+        mmsg->msg_hdr.msg_control = control;
+        mmsg->msg_hdr.msg_controllen = VANE_UDP_CONTROL_SIZE;
+    }
 }
 
 static void worker_initialize_slots(struct udp_worker *worker) {
@@ -123,6 +138,7 @@ static bool worker_init(struct udp_worker *worker,
         !worker_allocate_storage(worker))
         return false;
 
+    init_rx_messages(worker);
     worker_initialize_slots(worker);
     worker->hash_seed = vane_random_u64() ^ (uint64_t)args->worker_index;
     if (!worker_open_listener(worker)) return false;
@@ -171,7 +187,6 @@ static void worker_destroy(struct udp_worker *worker) {
     free(worker->tx_iov);
     free(worker->tx_controls);
     free(worker->down_storage);
-    free(worker->upstream_rx_storage);
 }
 
 void *vane_udp_worker_main(void *opaque) {

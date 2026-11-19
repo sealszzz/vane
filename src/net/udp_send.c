@@ -135,7 +135,9 @@ static bool queue_down_train(struct udp_worker *worker, const struct udp_flow *f
     if (worker->down_count == worker->down_capacity) return false;
     struct udp_down_item *item = &worker->down[worker->down_count];
     item->data = worker->down_storage + worker->down_count * UDP_MAX_PACKET;
-    memcpy(item->data, data, len);
+    /* Normal receives already occupy this slot. A split GRO train can
+     * wrap the queue and move a suffix down inside its original slot. */
+    if (item->data != data) memmove(item->data, data, len);
     item->len = len;
     item->segment_size = segment_size;
     item->has_segment = has_segment;

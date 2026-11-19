@@ -4,6 +4,23 @@
 #include <assert.h>
 #include <stdio.h>
 
+static void test_short_prefix(void) {
+    uint8_t prefix[] = {0x16, 0x03, 0x03};
+    struct io_buffer probe = {.data = prefix};
+    for (size_t n = 0U; n < sizeof(prefix); n++) {
+        probe.len = n;
+        assert(classify_prefix(&probe) == PREFIX_NEED_MORE);
+    }
+    probe.len = sizeof(prefix);
+    assert(classify_prefix(&probe) == PREFIX_TLS_LIKE);
+    prefix[1] = 0x02;
+    probe.len = 2U;
+    assert(classify_prefix(&probe) == PREFIX_NON_TLS);
+    prefix[0] = 'X';
+    probe.len = 1U;
+    assert(classify_prefix(&probe) == PREFIX_NON_TLS);
+}
+
 static void test_buffer_limit(void) {
     int pair[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, pair) == 0);
@@ -115,6 +132,7 @@ static void test_probe_transition(bool proxy, bool tls) {
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "limit") == 0) test_buffer_limit();
     else {
+        test_short_prefix();
         test_probe_transition(false, false);
         test_probe_transition(true, false);
         test_probe_transition(false, true);
