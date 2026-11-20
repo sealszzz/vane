@@ -12,6 +12,16 @@
 static struct vane_runtime_config test_runtime;
 static struct vane_worker_args test_args;
 
+ssize_t __wrap_sendmsg(int fd, const struct msghdr *message, int flags);
+
+ssize_t __wrap_sendmsg(int fd, const struct msghdr *message, int flags) {
+    VANE_UNUSED(fd);
+    VANE_UNUSED(message);
+    VANE_UNUSED(flags);
+    errno = ECONNREFUSED;
+    return -1;
+}
+
 static struct udp_flow_key make_key(uint16_t client_port) {
     struct udp_flow_key key = {0};
     struct vane_error err = {0};
@@ -90,6 +100,8 @@ static void worker_table_destroy(struct udp_worker *worker) {
     free(worker->flow_index);
     free(worker->free_flow_ids);
     free(worker->reclaim_candidates);
+    for (size_t i = 0U; i < worker->probe_cache_count; i++)
+        free(worker->probe_cache[i]);
     free(worker->probes);
     free(worker->free_probe_ids);
 }
@@ -266,6 +278,59 @@ static void test_reprobe_state_is_reversible(void) {
     worker_table_destroy(&worker);
 }
 
+static void test_reprobe_send_error_releases_probe(void) {
+    struct udp_worker worker;
+    worker_table_init(&worker, 4U, 8U, 16U);
+    test_runtime.udp_probe_max_datagrams = 2U;
+    test_runtime.udp_probe_max_bytes = 4096U;
+    struct udp_flow_key key = make_key(15001U);
+    char hostname[] = "localhost";
+    struct vane_sni_rule rule = {.kind = VANE_SNI_EXACT, .hostname = hostname};
+    struct vane_target_config target = {
+        .location_kind = VANE_LOCATION_ADDRESS, .location = key.local,
+        .sni = &rule, .sni_count = 1U,
+    };
+    struct vane_listener_config listener = {.targets = &target, .target_count = 1U};
+    struct vane_route_table *routes;
+    struct vane_error err = {0};
+    assert(vane_route_table_build(&listener, &routes, &err));
+    test_args.routes = routes;
+
+    size_t id;
+    struct udp_flow *flow = udp_flow_insert(&worker, &key, false, &id);
+    assert(flow != NULL);
+    flow->state = UDP_FLOW_ACTIVE;
+    flow->upstream_confirmed = true;
+    flow->target = &target;
+    int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    assert(fd >= 0);
+    flow->upstream_fd = fd;
+
+    const char *paths[] = {VANE_TEST_FIXTURE_DIR "/nextquic-v1-initial-1.bin",
+                           VANE_TEST_FIXTURE_DIR "/nextquic-v1-initial-2.bin"};
+    for (size_t i = 0; i < VANE_ARRAY_LEN(paths); i++) {
+        uint8_t packet[2048];
+        FILE *file = fopen(paths[i], "rb");
+        assert(file != NULL);
+        size_t len = fread(packet, 1U, sizeof(packet), file);
+        assert(len > 0U && feof(file) && fclose(file) == 0);
+        if (i == 0U) {
+            struct vane_quic_initial_identity candidate;
+            assert(vane_quic_read_initial_identity(packet, len, &candidate));
+            assert(udp_flow_begin_reprobe(&worker, id, &candidate));
+        }
+        assert(udp_probe_append(&worker, flow, packet, len, 0U, false));
+        udp_probe_route(&worker, id);
+    }
+
+    assert(flow->state == UDP_FLOW_ACTIVE && flow->upstream_fd == fd);
+    assert(flow->upstream_confirmed && flow->last_error == ECONNREFUSED);
+    assert(udp_probe_get(&worker, flow) == NULL);
+    assert(worker.pending_count == 0U && worker.free_probe_count == 1U);
+    worker_table_destroy(&worker);
+    vane_route_table_destroy(routes);
+}
+
 static void test_quic_retry_identity_tracking(void) {
     struct udp_flow flow = {0};
     struct vane_quic_initial_identity current = {
@@ -378,6 +443,34 @@ static void test_udp_error_history_reset_is_explicit(void) {
     assert(flow.last_error_log_ms == 0U);
     assert(flow.suppressed_errors == 0U);
 }
+
+static void test_negotiated_server_initial_is_retired(void) {
+    struct udp_flow flow = {0};
+    struct vane_quic_initial_identity client = {
+        .version = VANE_QUIC_VERSION_1, .destination_connection_id = {1U},
+        .destination_connection_id_len = 1U,
+        .source_connection_id = {2U}, .source_connection_id_len = 1U,
+    };
+    struct vane_quic_initial_identity server = {
+        .version = VANE_QUIC_VERSION_2, .destination_connection_id = {2U},
+        .destination_connection_id_len = 1U,
+        .source_connection_id = {3U}, .source_connection_id_len = 1U,
+    };
+    udp_flow_set_quic_identity(&flow, &client);
+    udp_flow_note_quic_retry(&flow, &server);
+    assert(!flow.has_quic_retry_dcid);
+    udp_flow_note_quic_initial(&flow, &server);
+    struct vane_quic_initial_identity continuation = client;
+    continuation.destination_connection_id[0] = 3U;
+    assert(!udp_flow_quic_identity_matches(&flow, &continuation));
+    continuation.version = VANE_QUIC_VERSION_2;
+    assert(udp_flow_quic_identity_matches(&flow, &continuation));
+    struct vane_quic_initial_identity replacement = client;
+    replacement.source_connection_id[0] = 4U;
+    udp_flow_set_quic_identity(&flow, &replacement);
+    assert(udp_flow_quic_identity_retired(&flow, &continuation, vane_monotonic_ms()));
+}
+
 static void test_retired_quic_identities(void) {
     struct udp_flow flow = {0};
     struct vane_quic_initial_identity a = {
@@ -416,6 +509,7 @@ static void test_retired_quic_identities(void) {
 
 int main(void) {
     test_server_initial_identity_tracking();
+    test_negotiated_server_initial_is_retired();
     test_retired_quic_identities();
     test_udp_error_history_reset_is_explicit();
     assert(udp_next_power_of_two(1U) == 1U);
@@ -426,6 +520,7 @@ int main(void) {
     test_pressure_reclaims_oldest_before_expanding();
     test_hard_idle_removes_confirmed_flow();
     test_reprobe_state_is_reversible();
+    test_reprobe_send_error_releases_probe();
     test_quic_retry_identity_tracking();
     return 0;
 }

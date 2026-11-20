@@ -481,19 +481,21 @@ bool udp_flow_quic_identity_matches(
         return false;
     if (vane_quic_initial_identity_equal(&flow->quic_identity, identity))
         return true;
-    return flow->quic_identity.version == identity->version &&
-           cid_equal(flow->quic_identity.source_connection_id,
-                     flow->quic_identity.source_connection_id_len,
-                     identity->source_connection_id,
-                     identity->source_connection_id_len) &&
-           ((flow->has_quic_retry_dcid &&
+    if (!cid_equal(flow->quic_identity.source_connection_id,
+                    flow->quic_identity.source_connection_id_len,
+                    identity->source_connection_id,
+                    identity->source_connection_id_len))
+        return false;
+    return (flow->has_quic_retry_dcid &&
+             flow->quic_identity.version == identity->version &&
              cid_equal(flow->quic_retry_dcid, flow->quic_retry_dcid_len,
                      identity->destination_connection_id,
                      identity->destination_connection_id_len)) ||
             (flow->has_quic_server_dcid &&
+             flow->quic_server_version == identity->version &&
              cid_equal(flow->quic_server_dcid, flow->quic_server_dcid_len,
                        identity->destination_connection_id,
-                       identity->destination_connection_id_len)));
+                       identity->destination_connection_id_len));
 }
 
 bool udp_flow_quic_identity_retired(
@@ -535,6 +537,7 @@ void udp_flow_set_quic_identity(
         }
         if (flow->has_quic_server_dcid) {
             struct vane_quic_initial_identity server = flow->quic_identity;
+            server.version = flow->quic_server_version;
             server.destination_connection_id_len = flow->quic_server_dcid_len;
             memcpy(server.destination_connection_id, flow->quic_server_dcid,
                    flow->quic_server_dcid_len);
@@ -552,6 +555,7 @@ void udp_flow_set_quic_identity(
     flow->quic_retry_dcid_len = 0U;
     memset(flow->quic_retry_dcid, 0, sizeof(flow->quic_retry_dcid));
     flow->has_quic_server_dcid = false;
+    flow->quic_server_version = 0U;
     flow->quic_server_dcid_len = 0U;
     memset(flow->quic_server_dcid, 0, sizeof(flow->quic_server_dcid));
 }
@@ -560,7 +564,6 @@ static bool server_identity_matches(
     const struct udp_flow *flow,
     const struct vane_quic_initial_identity *server_identity) {
     return flow != NULL && server_identity != NULL && flow->has_quic_identity &&
-           flow->quic_identity.version == server_identity->version &&
            cid_equal(flow->quic_identity.source_connection_id,
                      flow->quic_identity.source_connection_id_len,
                      server_identity->destination_connection_id,
@@ -571,6 +574,7 @@ void udp_flow_note_quic_retry(
     struct udp_flow *flow,
     const struct vane_quic_initial_identity *server_identity) {
     if (!server_identity_matches(flow, server_identity) ||
+        flow->quic_identity.version != server_identity->version ||
         flow->has_quic_retry_dcid || flow->has_quic_server_dcid)
         return;
     flow->quic_retry_dcid_len = server_identity->source_connection_id_len;
@@ -587,9 +591,16 @@ void udp_flow_note_quic_initial(
     if (!server_identity_matches(flow, server_identity) ||
         flow->has_quic_server_dcid)
         return;
+    uint32_t original = flow->quic_identity.version;
+    uint32_t observed = server_identity->version;
+    if (original != observed &&
+        !((original == VANE_QUIC_VERSION_1 && observed == VANE_QUIC_VERSION_2) ||
+          (original == VANE_QUIC_VERSION_2 && observed == VANE_QUIC_VERSION_1)))
+        return;
     /* RFC 9000 section 7.2: the first server Initial can change DCID again
      * after Retry. Keep both observed aliases for reordered client packets.
-     * This is passive routing metadata, not TLS authentication. */
+     * Compatible v1/v2 negotiation changes the version of this alias too. */
+    flow->quic_server_version = observed;
     flow->quic_server_dcid_len = server_identity->source_connection_id_len;
     memcpy(flow->quic_server_dcid, server_identity->source_connection_id,
            flow->quic_server_dcid_len);
@@ -624,12 +635,14 @@ bool udp_flow_commit_reprobe(struct udp_worker *worker, size_t id,
     if (target == NULL || target->location_kind == VANE_LOCATION_DROP)
         return false;
 
-    if (target == flow->target) {
+    if (target == flow->target ||
+        (target->proxy_protocol == flow->target->proxy_protocol &&
+         vane_addr_equal(&target->location, &flow->target->location))) {
         release_probe_accounting(worker, flow);
         memset(&flow->reprobe_identity, 0, sizeof(flow->reprobe_identity));
         flow->state = UDP_FLOW_ACTIVE;
-        flow->upstream_confirmed = false;
-        udp_flow_clear_error_history(flow);
+        flow->target = target;
+        /* The upstream socket and its response/error history are still valid. */
         flow->last_activity_ms = vane_monotonic_ms();
         return true;
     }

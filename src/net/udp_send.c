@@ -182,7 +182,7 @@ void udp_downstream_queue(struct udp_worker *worker,
     }
 }
 
-static bool send_plain_train(int fd, int family,
+static bool send_plain_train(const struct udp_flow *flow,
                              const uint8_t *data, size_t len,
                              uint16_t segment_size, bool use_gso,
                              uint8_t tclass, bool has_tclass,
@@ -190,7 +190,9 @@ static bool send_plain_train(int fd, int family,
     struct iovec iov = {.iov_base = (void *)(uintptr_t)data, .iov_len = len};
     const uint8_t *tc = has_tclass ? &tclass : NULL;
     const uint16_t *seg = use_gso ? &segment_size : NULL;
-    ssize_t n = vane_udp_sendmsg(fd, family, &iov, 1, NULL, NULL, tc, seg, err);
+    int family = vane_addr_effective_family(&flow->target->location);
+    ssize_t n = vane_udp_sendmsg(flow->upstream_fd, family, &iov, 1,
+                               NULL, NULL, tc, seg, err);
     if (n == (ssize_t)len) return true;
     if (n >= 0) errno = EIO;
     return false;
@@ -204,11 +206,11 @@ static bool send_proxy_train(const struct udp_flow *flow,
     struct vane_proxy_header header;
     if (!vane_proxy_v2_encode(&flow->key.client, &flow->key.local,
                                 VANE_PROXY_DGRAM, &header, err)) return false;
+    int family = vane_addr_effective_family(&flow->target->location);
     if (len == 0U) {
         struct iovec iov = {.iov_base = header.bytes, .iov_len = header.len};
         const uint8_t *tc = has_tclass ? &tclass : NULL;
-        ssize_t sent = vane_udp_sendmsg(flow->upstream_fd,
-                                          flow->target->location.storage.ss_family,
+        ssize_t sent = vane_udp_sendmsg(flow->upstream_fd, family,
                                           &iov, 1, NULL, NULL, tc, NULL, err);
         if (sent == (ssize_t)header.len) return true;
         if (sent >= 0) errno = EIO;
@@ -246,8 +248,7 @@ static bool send_proxy_train(const struct udp_flow *flow,
     uint16_t wire_segment = (uint16_t)wire_size;
     const uint8_t *tc = has_tclass ? &tclass : NULL;
     const uint16_t *seg = use_gso ? &wire_segment : NULL;
-    ssize_t sent = vane_udp_sendmsg(flow->upstream_fd,
-                                      flow->target->location.storage.ss_family,
+    ssize_t sent = vane_udp_sendmsg(flow->upstream_fd, family,
                                       iov, iov_count, NULL, NULL, tc, seg, err);
     if (sent == (ssize_t)expected) return true;
     if (sent >= 0) errno = EIO;
@@ -318,8 +319,8 @@ bool udp_send_upstream_views(struct udp_flow *flow,
         return send_upstream_views_individual(flow, packets, count, segment_size,
                                               tclass, has_tclass);
     const uint8_t *tc = has_tclass ? &tclass : NULL;
-    ssize_t sent = vane_udp_sendmsg(flow->upstream_fd,
-                                      flow->target->location.storage.ss_family,
+    int family = vane_addr_effective_family(&flow->target->location);
+    ssize_t sent = vane_udp_sendmsg(flow->upstream_fd, family,
                                       iov, iov_count, NULL, NULL, tc, &wire_segment, &err);
     if (sent == (ssize_t)expected) return true;
 
@@ -340,7 +341,7 @@ static bool send_upstream_individual(struct udp_flow *flow,
         struct vane_error err = {0};
         return flow->target->proxy_protocol
             ? send_proxy_train(flow, data, 0U, 0U, false, tclass, has_tclass, &err)
-            : send_plain_train(flow->upstream_fd, flow->target->location.storage.ss_family,
+            : send_plain_train(flow,
                                data, 0U, 0U, false,
                                tclass, has_tclass, &err);
     }
@@ -355,7 +356,7 @@ static bool send_upstream_individual(struct udp_flow *flow,
         bool ok = flow->target->proxy_protocol
             ? send_proxy_train(flow, data + offset, n, (uint16_t)n, false,
                                tclass, has_tclass, &err)
-            : send_plain_train(flow->upstream_fd, flow->target->location.storage.ss_family,
+            : send_plain_train(flow,
                                data + offset, n,
                                (uint16_t)n, false, tclass, has_tclass, &err);
         if (!ok) return false;
@@ -407,7 +408,7 @@ bool udp_send_upstream_aggregate(struct udp_flow *flow,
         bool ok = flow->target->proxy_protocol
             ? send_proxy_train(flow, data + offset, train_len, segment_size,
                                use_gso, tclass, has_tclass, &err)
-            : send_plain_train(flow->upstream_fd, flow->target->location.storage.ss_family,
+            : send_plain_train(flow,
                                data + offset, train_len,
                                segment_size, use_gso, tclass, has_tclass, &err);
         if (!ok && use_gso) {

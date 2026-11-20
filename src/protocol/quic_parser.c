@@ -71,19 +71,65 @@ static bool parse_version(const uint8_t *p, enum quic_version *version) {
 }
 
 static bool is_initial(uint8_t first, enum quic_version version) {
-    return version == QUIC_V1 ? (first & 0xf0U) == 0xc0U
-                              : (first & 0xf0U) == 0xd0U;
+    /* The QUIC Bit (0x40) can be cleared per RFC 9287. */
+    return (first & 0x30U) == (version == QUIC_V1 ? 0x00U : 0x10U);
 }
 
 static bool is_retry(uint8_t first, enum quic_version version) {
-    return version == QUIC_V1 ? (first & 0xf0U) == 0xf0U
-                              : (first & 0xf0U) == 0xe0U;
+    return (first & 0x30U) == (version == QUIC_V1 ? 0x30U : 0x00U);
+}
+
+static const uint8_t *read_cid(const uint8_t *data, size_t len, size_t *pos,
+                               size_t *cid_len) {
+    if (*pos >= len) return NULL;
+    *cid_len = data[(*pos)++];
+    if (*cid_len > VANE_QUIC_MAX_CID_LEN || *cid_len > len - *pos)
+        return NULL;
+    const uint8_t *cid = data + *pos;
+    *pos += *cid_len;
+    return cid;
+}
+
+static bool read_varint(const uint8_t *buf, size_t len, size_t *pos, size_t *out) {
+    if (*pos >= len) return false;
+    uint8_t first = buf[*pos];
+    size_t n = (size_t)1U << (first >> 6);
+    if (n > len - *pos) return false;
+    size_t value = first & 0x3fU;
+    (*pos)++;
+    for (size_t i = 1; i < n; i++) {
+        if (value > (SIZE_MAX >> 8)) return false;
+        value = (value << 8) | buf[(*pos)++];
+    }
+    *out = value;
+    return true;
+}
+
+static size_t find_initial(const uint8_t *data, size_t len) {
+    if (data == NULL) return len;
+    size_t pos = 0U;
+    while (len - pos >= 5U && (data[pos] & 0x80U) != 0U) {
+        enum quic_version version;
+        if (!parse_version(data + pos + 1U, &version)) break;
+        if (is_initial(data[pos], version)) return pos;
+        if (is_retry(data[pos], version)) break;
+
+        /* 0-RTT and Handshake packets carry a Length field after the
+         * two CIDs. An Initial may follow either in a coalesced datagram. */
+        pos += 5U;
+        size_t cid_len, payload_len;
+        if (read_cid(data, len, &pos, &cid_len) == NULL ||
+            read_cid(data, len, &pos, &cid_len) == NULL ||
+            !read_varint(data, len, &pos, &payload_len) ||
+            payload_len < 20U || payload_len > len - pos)
+            break;
+        pos += payload_len;
+    }
+    return len;
 }
 
 bool vane_quic_looks_like_initial(const uint8_t *data, size_t len) {
-    if (data == NULL || len < 5U || (data[0] & 0x80U) == 0U) return false;
-    enum quic_version version;
-    return parse_version(data + 1, &version) && is_initial(data[0], version);
+    return find_initial(data, len) < len;
 }
 
 bool vane_quic_looks_like_retry(const uint8_t *data, size_t len) {
@@ -102,16 +148,11 @@ bool vane_quic_read_long_header_identity(
     if (!parse_version(data + 1, &version)) return false;
 
     size_t pos = 5U;
-    size_t dcid_len = data[pos++];
-    if (dcid_len > VANE_QUIC_MAX_CID_LEN || dcid_len > len - pos)
-        return false;
-    const uint8_t *dcid = data + pos;
-    pos += dcid_len;
-    if (pos >= len) return false;
-
-    size_t scid_len = data[pos++];
-    if (scid_len > VANE_QUIC_MAX_CID_LEN || scid_len > len - pos)
-        return false;
+    size_t dcid_len, scid_len;
+    const uint8_t *dcid = read_cid(data, len, &pos, &dcid_len);
+    if (dcid == NULL) return false;
+    const uint8_t *scid = read_cid(data, len, &pos, &scid_len);
+    if (scid == NULL) return false;
 
     memset(identity, 0, sizeof(*identity));
     identity->version = ((uint32_t)data[1] << 24) |
@@ -123,16 +164,24 @@ bool vane_quic_read_long_header_identity(
         memcpy(identity->destination_connection_id, dcid, dcid_len);
     identity->source_connection_id_len = scid_len;
     if (scid_len != 0U)
-        memcpy(identity->source_connection_id, data + pos, scid_len);
+        memcpy(identity->source_connection_id, scid, scid_len);
     return true;
+}
+
+bool vane_quic_read_coalesced_initial_identity(
+    const uint8_t *data, size_t len,
+    struct vane_quic_initial_identity *identity) {
+    size_t offset = find_initial(data, len);
+    return offset < len &&
+           vane_quic_read_long_header_identity(data + offset, len - offset,
+                                               identity);
 }
 
 bool vane_quic_read_initial_identity(
     const uint8_t *data, size_t len,
     struct vane_quic_initial_identity *identity) {
     return len >= VANE_QUIC_MIN_INITIAL_DATAGRAM_SIZE &&
-           vane_quic_looks_like_initial(data, len) &&
-           vane_quic_read_long_header_identity(data, len, identity);
+           vane_quic_read_coalesced_initial_identity(data, len, identity);
 }
 
 bool vane_quic_initial_identity_equal(
@@ -147,21 +196,6 @@ bool vane_quic_initial_identity_equal(
                   a->destination_connection_id_len) == 0 &&
            memcmp(a->source_connection_id, b->source_connection_id,
                   a->source_connection_id_len) == 0;
-}
-
-static bool read_varint(const uint8_t *buf, size_t len, size_t *pos, size_t *out) {
-    if (*pos >= len) return false;
-    uint8_t first = buf[*pos];
-    size_t n = (size_t)1U << (first >> 6);
-    if (n > len - *pos) return false;
-    size_t value = first & 0x3fU;
-    (*pos)++;
-    for (size_t i = 1; i < n; i++) {
-        if (value > (SIZE_MAX >> 8)) return false;
-        value = (value << 8) | buf[(*pos)++];
-    }
-    *out = value;
-    return true;
 }
 
 static bool hkdf_extract(const uint8_t *salt, size_t salt_len,
@@ -400,37 +434,24 @@ static bool collect_datagram(const uint8_t *data, size_t len,
     size_t pos = 0;
     bool ok = false;
 
-    if (len < 7U) {
-        vane_error_set(err, "truncated QUIC Initial header");
-        goto done;
-    }
     while (pos < len) {
-        size_t packet_start = pos;
-        if (len - pos < 7U) break;
-        uint8_t first = data[pos++];
-        if ((first & 0x80U) == 0U || len - pos < 4U) break;
+        pos += find_initial(data + pos, len - pos);
+        if (pos == len) break;
+        size_t packet_start = pos++;
         enum quic_version version;
         if (!parse_version(data + pos, &version)) break;
         pos += 4U;
-        if (!is_initial(first, version)) break;
-        uint8_t dcid_len = data[pos++];
-        if (dcid_len > 20U || dcid_len > len - pos) {
+        size_t dcid_len, scid_len;
+        const uint8_t *dcid = read_cid(data, len, &pos, &dcid_len);
+        if (dcid == NULL) {
             vane_error_set(err, "invalid QUIC DCID");
             goto done;
         }
-        const uint8_t *dcid = data + pos;
-        pos += dcid_len;
-        if (pos >= len) {
-            vane_error_set(err, "missing QUIC SCID length");
-            goto done;
-        }
-        uint8_t scid_len = data[pos++];
-        if (scid_len > 20U || scid_len > len - pos) {
+        const uint8_t *scid = read_cid(data, len, &pos, &scid_len);
+        if (scid == NULL) {
             vane_error_set(err, "invalid QUIC SCID");
             goto done;
         }
-        const uint8_t *scid = data + pos;
-        pos += scid_len;
         size_t token_len = 0;
         if (!read_varint(data, len, &pos, &token_len) || token_len > len - pos) {
             vane_error_set(err, "truncated QUIC token");
@@ -469,6 +490,12 @@ static bool collect_datagram(const uint8_t *data, size_t len,
     ok = true;
 done:
     return ok;
+}
+
+static bool check_client_initial_size(size_t len, struct vane_error *err) {
+    if (len >= VANE_QUIC_MIN_INITIAL_DATAGRAM_SIZE) return true;
+    vane_error_set(err, "QUIC Initial datagram is smaller than 1200 bytes");
+    return false;
 }
 
 static bool same_context(const struct initial_packet *packets, size_t count) {
@@ -761,10 +788,8 @@ vane_quic_probe_feed(struct vane_quic_probe_state *state,
     if (!vane_quic_looks_like_initial(datagram, datagram_len))
         return state->have_context ? VANE_PROBE_NEED_MORE
                                    : VANE_PROBE_NOT_PROTOCOL;
-    if (datagram_len < VANE_QUIC_MIN_INITIAL_DATAGRAM_SIZE) {
-        vane_error_set(err, "QUIC Initial datagram is smaller than 1200 bytes");
+    if (!check_client_initial_size(datagram_len, err))
         return VANE_PROBE_MALFORMED;
-    }
 
     struct initial_packet *fresh = NULL;
     size_t fresh_count = 0U, fresh_capacity = 0U;
@@ -826,7 +851,8 @@ vane_quic_parse_client_hello(const struct vane_datagram_view *datagrams,
     for (size_t i = 0; i < datagram_count; i++) {
         if (!vane_quic_looks_like_initial(datagrams[i].data, datagrams[i].len)) continue;
         saw_candidate = true;
-        if (!collect_datagram(datagrams[i].data, datagrams[i].len,
+        if (!check_client_initial_size(datagrams[i].len, err) ||
+            !collect_datagram(datagrams[i].data, datagrams[i].len,
                               &packets, &packet_count, &packet_capacity,
                               &have_largest, &largest, &key_cache, err)) {
             protection_cache_cleanse(&key_cache);

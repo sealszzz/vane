@@ -106,12 +106,14 @@ PENDING -> ACTIVE(unconfirmed) -> ACTIVE(confirmed) -> QUIESCENT
 - QUIC version plus both connection IDs identify the active Initial context.
   The first server Retry and the first server Initial are observed on the
   connected upstream path. Their Source Connection IDs are accepted as client
-  Initial destination IDs only with the original client SCID and version.
-  Both aliases remain valid for reordering; later conflicting server updates
-  are ignored. An arbitrary unobserved DCID change still requires a side probe.
-  These observations are routing metadata, not cryptographic authentication.
-- If reprobe selects the current target, the connected upstream socket and
-  source port are retained. If it selects a different target, Vane opens,
+  Initial destination IDs with the original client SCID. The Retry alias
+  requires the original version; the Initial alias uses the observed version,
+  including a compatible v1/v2 switch. Both aliases remain valid for reordering
+  and later conflicting observations are ignored. An unobserved DCID still
+  requires a side probe. These observations are used only for routing.
+- If reprobe selects the same upstream address and PROXY v2 setting, the
+  connected socket, source port, and confirmation state are retained. If it
+  selects a different upstream or framing mode, Vane opens,
   configures, connects, and registers the replacement socket before closing the
   old one. A new epoll generation rejects stale events from the old socket.
 - Malformed, incomplete, timed-out, denied, unroutable, or capacity-limited

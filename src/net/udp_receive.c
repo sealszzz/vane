@@ -89,7 +89,11 @@ static void process_segment(struct udp_worker *worker,
             return;
         }
         if (flow->state == UDP_FLOW_REPROBING) {
-            if (packet_matches_reprobe_candidate(flow, data, len))
+            bool candidate = looks_initial
+                ? vane_quic_initial_identity_equal(&flow->reprobe_identity,
+                                                   &incoming)
+                : packet_matches_reprobe_candidate(flow, data, len);
+            if (candidate)
                 append_probe_packet(worker, id, data, len, tclass, has_tclass);
             else if (!looks_initial ||
                      udp_flow_quic_identity_matches(flow, &incoming))
@@ -210,7 +214,7 @@ static size_t try_rebatch_public(struct udp_worker *worker, int first, int total
             worker->rx_storage + (size_t)j * UDP_MAX_PACKET;
         if (active_packet_requires_segment_path(worker, flow, packet,
                                                 segment_size))
-            return 0U;
+            break;
         packets[count++] = packet;
     }
     if (count < 2U) return 0U;
@@ -356,18 +360,17 @@ void udp_receive_public(struct udp_worker *worker) {
 static void note_upstream_quic_identity(struct udp_flow *flow,
                                      const uint8_t *data, size_t len,
                                      uint16_t gro_segment_size) {
+    if (!flow->has_quic_identity || flow->has_quic_server_dcid) return;
     size_t segment = gro_segment_size != 0U ? gro_segment_size : len;
     size_t offset = 0U;
     while (offset < len) {
         size_t n = VANE_MIN(segment, len - offset);
         struct vane_quic_initial_identity identity;
-        bool initial = vane_quic_looks_like_initial(data + offset, n);
-        bool retry = vane_quic_looks_like_retry(data + offset, n);
-        if ((initial || retry) &&
-            vane_quic_read_long_header_identity(data + offset, n, &identity)) {
-            if (initial) udp_flow_note_quic_initial(flow, &identity);
-            else udp_flow_note_quic_retry(flow, &identity);
-        }
+        if (vane_quic_read_coalesced_initial_identity(data + offset, n, &identity))
+            udp_flow_note_quic_initial(flow, &identity);
+        else if (vane_quic_looks_like_retry(data + offset, n) &&
+                 vane_quic_read_long_header_identity(data + offset, n, &identity))
+            udp_flow_note_quic_retry(flow, &identity);
         offset += n;
     }
 }

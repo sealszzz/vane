@@ -86,6 +86,7 @@ struct udp_flow {
     uint8_t quic_retry_dcid[VANE_QUIC_MAX_CID_LEN];
     size_t quic_retry_dcid_len;
     bool has_quic_server_dcid;
+    uint32_t quic_server_version;
     uint8_t quic_server_dcid[VANE_QUIC_MAX_CID_LEN];
     size_t quic_server_dcid_len;
     struct vane_quic_initial_identity reprobe_identity;

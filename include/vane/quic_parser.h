@@ -7,6 +7,8 @@
 
 #define VANE_QUIC_MAX_CID_LEN 20U
 #define VANE_QUIC_MIN_INITIAL_DATAGRAM_SIZE 1200U
+#define VANE_QUIC_VERSION_1 UINT32_C(0x00000001)
+#define VANE_QUIC_VERSION_2 UINT32_C(0x6b3343cf)
 
 struct vane_quic_initial_identity {
     uint32_t version;
@@ -41,6 +43,10 @@ vane_quic_parse_client_hello(const struct vane_datagram_view *datagrams,
 bool vane_quic_looks_like_initial(const uint8_t *data, size_t len);
 bool vane_quic_looks_like_retry(const uint8_t *data, size_t len);
 bool vane_quic_read_long_header_identity(
+    const uint8_t *data, size_t len,
+    struct vane_quic_initial_identity *identity);
+/* Server Initials can be smaller than the client datagram minimum. */
+bool vane_quic_read_coalesced_initial_identity(
     const uint8_t *data, size_t len,
     struct vane_quic_initial_identity *identity);
 bool vane_quic_read_initial_identity(

@@ -128,7 +128,8 @@ def make_quic_initial(host: str, version: int, *, scid: bytes | None = None,
                       packet_number: int = 0,
                       initial_dcid: bytes | None = None,
                       server: bool = False,
-                      token: bytes = b"") -> bytes:
+                      token: bytes = b"",
+                      grease_bit: bool = False) -> bytes:
     if not HAVE_CRYPTOGRAPHY:
         raise RuntimeError("cryptography is unavailable")
     if version == 1:
@@ -143,6 +144,9 @@ def make_quic_initial(host: str, version: int, *, scid: bytes | None = None,
         key_label, iv_label, hp_label = b"quicv2 key", b"quicv2 iv", b"quicv2 hp"
     else:
         raise ValueError("unsupported QUIC version")
+
+    if grease_bit:
+        first &= ~0x40
 
     if dcid is None:
         dcid = bytes.fromhex("8394c8f03e515708")

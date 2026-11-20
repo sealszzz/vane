@@ -251,6 +251,9 @@ if(VANE_BUILD_TESTS)
       target_link_options(test_${test_name} PRIVATE
         -Wl,--wrap=sendmmsg -Wl,--wrap=sendmsg)
     endif()
+    if(test_name STREQUAL "udp_flow")
+      target_link_options(test_${test_name} PRIVATE -Wl,--wrap=sendmsg)
+    endif()
     if(test_name STREQUAL "startup_notify")
       target_link_options(test_${test_name} PRIVATE
         -Wl,--wrap=socket -Wl,--wrap=sendto)

@@ -7,6 +7,14 @@
 - Receive upstream UDP data directly into a downstream batch slot, moving
   only split trains when needed. Reuse public receive descriptors across calls.
 - Parse a single contiguous QUIC CRYPTO frame from the decrypted payload.
+- Recognize QUIC v2 Retry, Initial and Retry with a cleared QUIC Bit, and
+  Initial packets after other length-bearing packets in a coalesced datagram.
+  Retain the negotiated v1 or v2 version on the observed server Initial CID
+  alias and batch packets up to the next receive-side classification point.
+- Keep the socket, source port, and error history when UDP reclassification
+  resolves to the same upstream address and PROXY v2 setting. Release the
+  completed probe slot even if forwarding its buffered datagrams fails.
+- Preserve UDP DSCP and ECN when an upstream uses IPv4-mapped IPv6 notation.
 
 ## Previous TCP and QUIC routing fixes
 

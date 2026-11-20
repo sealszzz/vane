@@ -135,18 +135,19 @@ static bool probe_initial_identity(
     return false;
 }
 
-static bool flush_pending_probe(struct udp_worker *worker, size_t id) {
+static void flush_pending_probe(struct udp_worker *worker, size_t id) {
     struct udp_flow *flow = &worker->flows[id];
     struct udp_probe *probe = udp_probe_get(worker, flow);
-    if (probe == NULL) return true;
+    if (probe == NULL) return;
     for (size_t i = 0; i < probe->count; i++) {
         const uint8_t *packet = probe->data + probe->offsets[i];
         if (!udp_forward_upstream(worker, id, packet, probe->lengths[i],
                                   probe->tclasses[i], probe->has_tclass[i]))
-            return false;
+            break;
     }
+    /* A send failure can preserve a confirmed socket or remove the flow.
+     * Either way the completed probe no longer owns a pending slot. */
     udp_probe_destroy(worker, flow);
-    return true;
 }
 
 void udp_probe_route(struct udp_worker *worker, size_t id) {
@@ -216,5 +217,5 @@ void udp_probe_route(struct udp_worker *worker, size_t id) {
         udp_flow_set_quic_identity(flow, &identity);
     else if (result != VANE_PROBE_MATCHED)
         udp_flow_set_quic_identity(flow, NULL);
-    (void)flush_pending_probe(worker, id);
+    flush_pending_probe(worker, id);
 }

@@ -56,18 +56,23 @@ def main() -> None:
     upstream_port = reserve_udp_port()
     ready = threading.Event()
     stop = threading.Event()
+    received_tclass: list[int] = []
 
     def upstream() -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.bind(("127.0.0.1", upstream_port))
         sock.settimeout(0.1)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_RECVTOS, 1)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, 0xBB)
         ready.set()
         try:
             while not stop.is_set():
                 try:
-                    _, peer = sock.recvfrom(65535)
+                    _, ancillary, _, peer = sock.recvmsg(65535, socket.CMSG_SPACE(1))
                 except socket.timeout:
                     continue
+                received_tclass.extend(value[0] for level, kind, value in ancillary
+                                      if level == socket.IPPROTO_IP and kind == socket.IP_TOS)
                 sock.sendto(b"OK", peer)
         finally:
             sock.close()
@@ -82,7 +87,7 @@ def main() -> None:
             "address": f"[::]:{public_port}",
             "transport": "udp",
             "targets": [{
-                "location": f"127.0.0.1:{upstream_port}",
+                "location": f"[::ffff:127.0.0.1]:{upstream_port}",
                 "sni": ["localhost"],
             }],
         }],
@@ -121,11 +126,16 @@ def main() -> None:
             packet2 = handle.read()
         client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         client.settimeout(1.0)
+        client.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, 0x2E)
+        client.setsockopt(socket.IPPROTO_IP, socket.IP_RECVTOS, 1)
         try:
             client.sendto(packet1, ("127.0.0.1", public_port))
             client.sendto(packet2, ("127.0.0.1", public_port))
-            assert client.recvfrom(65535)[0] == b"OK"
-            assert client.recvfrom(65535)[0] == b"OK"
+            for _ in range(2):
+                payload, ancillary, _, peer = client.recvmsg(65535, socket.CMSG_SPACE(1))
+                assert payload == b"OK" and peer == ("127.0.0.1", public_port)
+                assert (socket.IPPROTO_IP, socket.IP_TOS, b"\xbb") in ancillary
+            assert received_tclass == [0x2E, 0x2E], received_tclass
         finally:
             client.close()
 
