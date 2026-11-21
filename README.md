@@ -1,28 +1,8 @@
 # Vane
 
-Vane is a Linux pass-through router for TCP TLS and UDP QUIC traffic. It
-selects an upstream from the TLS Server Name Indication (SNI) without
-terminating TLS or QUIC.
-
-## Highlights
-
-- TCP TLS and UDP QUIC listeners with exact, wildcard, `none`, `any`, fallback,
-  and drop routes.
-- QUIC v1 and v2 Initial parsing with bounded CRYPTO reassembly.
-- Worker-owned epoll data paths with no per-flow threads or asynchronous
-  runtime.
-- UDP GRO/GSO support with automatic fallback when kernel offloads are
-  unavailable.
-- Connected UDP flows retain their upstream socket and source port while they
-  remain in the flow table.
-- Delayed QUIC Initial packets can repair a fallback flow, and a new QUIC
-  connection reusing the same public tuple can be rerouted without restarting
-  the process.
-- Strict JSON validation without legacy aliases or runtime tuning fields.
-- Optional TCP and UDP PROXY protocol v2 output.
-
-Vane does not act as a TLS endpoint, QUIC endpoint, HTTP server, DNS resolver,
-or Linux TPROXY listener.
+Vane forwards TCP TLS and UDP QUIC traffic on Linux. It selects an upstream by
+the visible TLS Server Name Indication (SNI) and leaves TLS and QUIC termination
+to that upstream. QUIC v1 and v2 are supported for SNI routing.
 
 ## Supported platforms
 
@@ -44,70 +24,36 @@ cd "$PACKAGE"
 sudo ./install.sh
 ```
 
-The installer verifies the package checksums and architecture, validates the
-configuration before replacing installed files, installs a hardened systemd
-service, and restores the previous installation if activation fails.
-Activation waits for every listener worker to report ready before the upgrade
-is committed.
+The installer verifies package checksums and architecture, validates the
+configuration, and installs a systemd service. On upgrade it preserves a
+valid configuration and rolls back if activation fails. The service reports
+ready after every listener worker has started.
 
-On a first installation, the example configuration is installed but the service
-is not started automatically. Edit `/etc/vane/vane.json`, then run:
+On a first installation, edit the example at `/etc/vane/vane.json` before
+starting the service.
 
 ```sh
 sudo /usr/local/bin/vane --check /etc/vane/vane.json
 sudo systemctl restart vane
 ```
 
-Existing valid configurations are preserved during upgrades. The standalone
-UDP offload diagnostic is not deployed, and a successful upgrade removes the
-previously installed copy if present.
-
 ## Complete uninstall
 
-Run the uninstaller from the extracted binary package (or source tree):
+Run the uninstaller from the extracted binary package or source tree.
 
 ```sh
 sudo ./uninstall.sh
 ```
 
-This stops and disables the systemd service, removes the application binary,
-legacy diagnostic binary, service unit, dedicated configuration directory
-(including all edited settings), and its dedicated system user/group if they
-match the installer-created identity. It also removes any files installed by
-`cmake --install` under Vane's own shared-data and documentation directories.
-The uninstaller does not remove historical entries from the *shared* systemd
-journal or any copies of archives you've kept elsewhere.
+This stops and disables the service and removes Vane's binaries, unit,
+documentation, and configuration directory including edited settings. It
+also removes the dedicated system user and group created by the installer.
 
 ## Configuration
 
-A listener contains a transport, a numeric socket address, and a target set. DNS names are not accepted as listener or upstream addresses.
-
-```json
-{
-  "logging": {
-    "level": "info"
-  },
-  "listeners": [
-    {
-      "transport": "tcp",
-      "address": "[::]:443",
-      "targets": [
-        {
-          "location": "[::1]:9001",
-          "sni": ["example.com", "*.example.net"],
-          "proxy_protocol": false
-        },
-        {
-          "location": "[::1]:9009",
-          "proxy_protocol": false
-        }
-      ]
-    }
-  ]
-}
-```
-
-Validate a configuration without starting the service:
+Each listener has a transport, a numeric IP socket address, and upstream
+targets. The [example configuration](configs/vane.json) covers both TCP and
+UDP on port 443. Validate edits before restarting the service.
 
 ```sh
 vane --check /etc/vane/vane.json
@@ -123,28 +69,18 @@ systemctl status vane
 journalctl -u vane -n 200 -o cat --no-pager
 ```
 
-Available log levels are `error`, `warn`, `info`, `debug`, and `trace`.
-
-The UDP GSO/GRO diagnostic tool is built for tests but is not installed with Vane.
-To run it from a local development build:
-
-```sh
-./build/vane_udp_offload_probe
-```
-
 ## GitHub Actions
 
-The workflow is triggered manually from **Actions > Vane Build > Run workflow**.
-Select `build-only` to compile, test, and upload temporary workflow artifacts,
-`publish` to create a new GitHub Release, or `replace` to rebuild the same
-version. A normal `git push` does not trigger this workflow.
+Open **Actions > Vane Build > Run workflow** after pushing the commit.
 
-Both publication modes require the default branch and all validation gates.
-`publish` rejects existing releases and conflicting tags. `replace` removes the
-old release and its assets, moves the version tag to the selected commit, and
-publishes both architectures, matching source, and checksums. It does not
-change `VERSION`. Replacement is not atomic; rerun `replace` if publication
-fails. Repository tag protection or immutable releases may block replacement.
+| Mode | Result |
+|---|---|
+| `build-only` | Build, test, and upload workflow artifacts |
+| `publish` | Publish a new version from the default branch |
+| `replace` | Replace the published assets for the current version from the default branch |
+
+See [Release validation](BUILDING.md#release-validation) for the checks and
+replacement procedure.
 
 ## Documentation
 

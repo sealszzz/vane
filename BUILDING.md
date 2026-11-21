@@ -73,9 +73,8 @@ JSONC_EXPECTED_COMMIT="REPLACE_WITH_JSONC_40_HEX_COMMIT" \
 ./scripts/build-release.sh linux-amd64-v3
 ```
 
-The UDP offload diagnostic is retained as a development/CI test executable,
-not shipped or installed as a standalone command. The binary package contains
-`vane`, `install.sh` and `uninstall.sh` plus configuration and documentation.
+The UDP offload diagnostic is a development and CI test executable. Run
+`./build/vane_udp_offload_probe` from a local build.
 
 For a local build using previously downloaded dependencies, provide both
 source trees or archives (the build script itself will not download them):
@@ -116,9 +115,9 @@ Publishing and replacement require the default branch. `publish` refuses an
 existing release and may reuse an interrupted run's tag only at the same commit.
 `replace` removes the old release and assets after all checks pass, moves the
 tag to the selected commit using an explicit force-with-lease, and recreates
-the release. API errors stop publication. Replacement is not atomic; rerun
-`replace` after a failure. Repository tag rules or immutable-release settings
-may prevent it. Dependency selection remains latest-stable for each run.
+the release. If replacement fails after deleting the old release, rerun
+`replace` to finish publication. Repository tag rules or immutable-release
+settings may prevent it. Each run resolves the latest stable dependency tags.
 
 A failed validation stage prevents packaging or publication.
 
@@ -155,14 +154,14 @@ cmake --build build --target vane_probe_bench
 
 `tools/relay_bench.py OLD_BINARY NEW_BINARY OUTPUT_JSONL` alternates five local
 TCP ping-pong and bulk comparisons with each Vane instance pinned to one CPU.
-Compile its optional epoll-call counter first:
+Run the benchmark with its epoll-call counter in a temporary directory.
 
 ```sh
-cc -O2 -shared -fPIC tools/epoll_counter.c -ldl -o tools/epoll_counter.so
-python3 tools/relay_bench.py /path/to/old/vane /path/to/new/vane /tmp/relay.jsonl
+bench_dir=$(mktemp -d)
+cp tools/relay_bench.py "$bench_dir/"
+cc -O2 -shared -fPIC tools/epoll_counter.c -ldl -o "$bench_dir/epoll_counter.so"
+python3 "$bench_dir/relay_bench.py" /path/to/old/vane /path/to/new/vane /tmp/relay.jsonl
 ```
 
-The counter assumes this single-worker diagnostic only. Instrumented latency
-is not used as a performance result. Python, loopback, host scheduling, and
-kernel offloads limit what these comparisons establish; they are not WAN or
-production-capacity measurements. No absolute speedup is a release gate.
+Use the uninstrumented runs to compare loopback latency and throughput.
+The counter measures epoll calls in the single-worker runs.

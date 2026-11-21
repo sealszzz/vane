@@ -2,6 +2,14 @@
 
 ## Current release
 
+- Start the TCP half-close timer when FIN arrives, including after a long
+  idle period. Read the clock for relay activity only after half-close and
+  read the original destination address only for PROXY v2 targets.
+- Preserve datagram boundaries across the unsent portion of a UDP GRO train
+  when upstream GSO fails, including short tails and per-datagram PROXY v2.
+- Reuse the UDP flow lookup across classification and rebatching. Use small
+  iovec arrays for individual upstream datagrams.
+- Document ECH outer-name routing and put route precedence in one table.
 - Route short non-TLS TCP prefixes as soon as the available bytes rule out
   TLS. Read each endpoint once per readiness event, including half-close.
 - Receive upstream UDP data directly into a downstream batch slot, moving

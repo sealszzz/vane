@@ -56,12 +56,11 @@ struct tcp_connection {
     int client_fd;
     int upstream_fd;
     struct vane_addr client_addr;
-    struct vane_addr local_addr;
     const struct vane_target_config *target;
     struct io_buffer c2u;
     struct io_buffer u2c;
     uint64_t deadline_ms;
-    uint64_t last_activity_ms;
+    uint64_t half_close_activity_ms;
     uint32_t client_events;
     uint32_t upstream_events;
     bool client_eof;
@@ -222,9 +221,12 @@ static ssize_t buffer_write_to_fd(struct io_buffer *buffer, int fd) {
 
 static bool connection_read(struct tcp_connection *c, struct io_buffer *buffer,
                             int fd, bool *eof) {
+    bool was_eof = *eof;
     ssize_t n = buffer_read_from_fd(buffer, fd, eof);
     if (n < 0) return false;
-    if (n > 0) c->last_activity_ms = vane_monotonic_ms();
+    if ((!was_eof && *eof) ||
+        (n > 0 && (c->client_eof || c->upstream_eof)))
+        c->half_close_activity_ms = vane_monotonic_ms();
     return true;
 }
 
@@ -232,7 +234,8 @@ static bool connection_write(struct tcp_connection *c, struct io_buffer *buffer,
                              int fd) {
     ssize_t n = buffer_write_to_fd(buffer, fd);
     if (n < 0) return false;
-    if (n > 0) c->last_activity_ms = vane_monotonic_ms();
+    if (n > 0 && (c->client_eof || c->upstream_eof))
+        c->half_close_activity_ms = vane_monotonic_ms();
     if (buffer->len == 0U) buffer_trim_empty(buffer);
     return true;
 }
@@ -323,8 +326,20 @@ static bool refresh_connection(struct tcp_worker *worker, uint32_t id) {
 static bool prepend_proxy_header(struct tcp_connection *c,
                                  struct vane_error *err) {
     if (!c->target->proxy_protocol) return true;
+    struct sockaddr_storage storage;
+    socklen_t len = sizeof(storage);
+    struct vane_addr local;
+    if (getsockname(c->client_fd, (struct sockaddr *)&storage, &len) != 0) {
+        vane_error_set(err, "getsockname for TCP PROXY header: %s",
+                       strerror(errno));
+        return false;
+    }
+    if (!vane_addr_from_sockaddr((const struct sockaddr *)&storage, len, &local)) {
+        vane_error_set(err, "invalid local address for TCP PROXY header");
+        return false;
+    }
     struct vane_proxy_header header;
-    if (!vane_proxy_v2_encode(&c->client_addr, &c->local_addr,
+    if (!vane_proxy_v2_encode(&c->client_addr, &local,
                                 VANE_PROXY_STREAM, &header, err)) return false;
     if (!buffer_reserve_tail(&c->c2u, header.len)) {
         vane_error_set(err, "TCP relay buffer cannot hold PROXY header");
@@ -604,8 +619,7 @@ static void handle_upstream_event(struct tcp_worker *worker, uint32_t id,
 }
 
 static bool allocate_connection(struct tcp_worker *worker, int client_fd,
-                                const struct vane_addr *client,
-                                const struct vane_addr *local) {
+                                const struct vane_addr *client) {
     if (worker->free_count == 0) { close(client_fd); return false; }
     uint32_t id = worker->free_ids[--worker->free_count];
     struct tcp_connection *c = &worker->connections[id];
@@ -618,11 +632,9 @@ static bool allocate_connection(struct tcp_worker *worker, int client_fd,
     c->client_fd = client_fd;
     c->upstream_fd = -1;
     c->client_addr = *client;
-    c->local_addr = *local;
     buffer_init(&c->c2u, worker->probe_max, &worker->buffer_cache);
     buffer_init(&c->u2c, worker->u2c_max, &worker->buffer_cache);
-    c->last_activity_ms = vane_monotonic_ms();
-    c->deadline_ms = c->last_activity_ms + worker->args->runtime->tcp_probe_timeout_ms;
+    c->deadline_ms = vane_monotonic_ms() + worker->args->runtime->tcp_probe_timeout_ms;
     c->client_events = EPOLLIN | EPOLLRDHUP | EPOLLET;
     if (!epoll_add(worker->epoll_fd, client_fd, c->client_events,
                    event_token(TCP_EVENT_CLIENT, id, c->generation))) {
@@ -652,17 +664,13 @@ static void accept_clients(struct tcp_worker *worker) {
             return;
         }
         accepted++;
-        struct vane_addr client, local;
-        struct sockaddr_storage local_storage;
-        socklen_t local_len = sizeof(local_storage);
+        struct vane_addr client;
         if (!vane_addr_from_sockaddr((struct sockaddr *)&peer_storage, peer_len, &client) ||
-            getsockname(fd, (struct sockaddr *)&local_storage, &local_len) != 0 ||
-            !vane_addr_from_sockaddr((struct sockaddr *)&local_storage, local_len, &local) ||
             !configure_stream_socket(fd, worker->args->runtime)) {
             close(fd);
             continue;
         }
-        (void)allocate_connection(worker, fd, &client, &local);
+        (void)allocate_connection(worker, fd, &client);
     }
 }
 
@@ -679,7 +687,7 @@ static void expire_connections(struct tcp_worker *worker, uint64_t now) {
         }
         if (c->state == CONN_RELAYING &&
             (c->client_eof || c->upstream_eof) &&
-            now - c->last_activity_ms >= half_close_idle) {
+            now - c->half_close_activity_ms >= half_close_idle) {
             close_connection(worker, id);
         }
     }

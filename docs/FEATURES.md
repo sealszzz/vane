@@ -1,27 +1,17 @@
 # Features and boundaries
 
-| Behavior | Implementation |
+| Traffic | Routing input |
 |---|---|
-| TCP and UDP on the same IP and port | Separate transport sockets; `SO_REUSEPORT` shards each transport across workers |
-| IPv4, IPv6, and dual-stack `[::]` | Supported |
-| Exact TLS SNI | Sorted binary search |
-| Wildcard SNI | Longest matching suffix first |
-| `none`, `any`, fallback, and `drop` | Supported |
-| TCP and UDP PROXY v2 | Supported, disabled by default |
-| ClientHello spanning TLS records | Bounded reassembly by declared length |
-| QUIC v1/v2 Initial | Multi-datagram CRYPTO reassembly |
-| Malformed TLS or QUIC | Strict rejection |
-| UDP GRO and GSO | Bidirectional paths, short tail segments, persistent compatibility fallback, and bounded backpressure work |
-| UDP idle resume | Same connected file descriptor and source port |
-| UDP active-flow reclassification | Delayed Initial recovery, same-tuple new connection detection, reversible bounded reprobe, and atomic target switch |
-| UDP dynamic capacity | Base tier and two-times burst tier, 80/65 watermarks |
-| UDP long-term cleanup | Confirmed-flow 24-hour hard-idle limit with earlier bounded cleanup rules |
-| PKTINFO, TCLASS, and ECN | Preserved for IPv4 and IPv6 |
-| TCP half-close | Unified state machine, no RDHUP retrigger, 120-second idle cleanup |
-| Configuration | Strict JSON without compatibility aliases |
+| TCP TLS | SNI from the visible ClientHello, including one split across TLS records |
+| QUIC v1 or v2 | SNI from the visible ClientHello reassembled from Initial packets |
+| TLS or QUIC with ECH | SNI in the outer ClientHello, typically the ECH public name |
+| UDP on a new tuple without a recognized Initial | Listener fallback |
 
-Vane intentionally does not use an asynchronous runtime, per-flow tasks,
-message channels, blocking pools, asynchronous semaphores, cross-worker packet
-queues, or a separate cross-worker tuple-affinity cache. Each UDP worker still
-maintains its own bounded tuple-to-flow table. Vane is not a QUIC endpoint and
-does not implement congestion control or connection migration.
+ECH encrypts the inner ClientHello. Configure a route for the visible public
+name to reach an upstream that can handle that ECH configuration. See
+[RFC 9849](https://www.rfc-editor.org/rfc/rfc9849.html#section-10.5).
+
+TCP and UDP can share the same IP and port. Both support IPv4, IPv6, dual-stack
+`[::]` listeners, and optional PROXY protocol v2. See [JSON
+configuration](CONFIG.md) for route precedence and [Architecture](ARCHITECTURE.md)
+for buffering, UDP flow retention, and offload handling.

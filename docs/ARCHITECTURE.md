@@ -2,50 +2,34 @@
 
 ## Threads and ownership
 
-Each listener creates fixed `SO_REUSEPORT` pthread workers:
+Each listener uses a fixed group of `SO_REUSEPORT` workers. The group size
+depends on CPU affinity, listener count, and built-in capacity. Each worker
+owns its sockets, epoll instance, connection or flow slots, and buffers.
+Workers share read-only routing tables built at startup.
 
-```text
-worker threads = listener count x workers_per_listener
-```
-
-Each worker exclusively owns its listener file descriptor, epoll instance,
-connection or flow slab, upstream sockets, and buffer pools. Routing tables are
-built at startup and remain read-only. Packets never move between workers.
-
-When NOTIFY_SOCKET is present, the main process sends READY=1 only after all
-workers have initialized. The installed Type=notify service waits for that
-notification; an initialization or notification failure aborts startup.
+The installed systemd service uses `Type=notify`. The main process sends
+`READY=1` after all workers initialize. An initialization or notification
+failure aborts startup.
 
 ## TCP
 
-```text
-PROBING -> CONNECTING -> RELAYING -> HALF_CLOSED -> FREE
-```
+The TCP capacity of 4096 connections is shared across TCP listener workers.
+Connections progress through probing, nonblocking upstream connect, and
+relay. An epoll token combines the slot ID and generation to reject stale
+events after reuse.
 
-- Connections are accepted with `SOCK_NONBLOCK | SOCK_CLOEXEC`.
-- The ClientHello prefix is stored directly in the client-to-upstream buffer.
-- Nonblocking connect, epoll interest, reads, writes, half-close handling, and
-  deadlines share one state machine.
-- The epoll token contains a connection ID and generation so reused slots or file
-  descriptors cannot match stale events.
-- Steady-state relay storage is 16 KiB per direction. TLS probing may expand to
-  the handshake limit, and the larger allocation is released after draining.
+- The probe reads into the client-to-upstream buffer. Relay storage is 16 KiB
+  per direction. The larger TLS probe allocation is released after draining.
 - After a read or upstream connect completes, buffered relay data is sent
-  immediately in that callback. EPOLLOUT is retained only while data remains.
-  A full read buffer that is drained directly forces an ET readiness recheck,
-  so unread data cannot wait forever for a new edge.
-- A full probe also forces this recheck before routing changes its buffer
-  limit. Reads respect the logical limit even when the allocation is larger.
-- Both endpoints share the flush and half-close transition path.
-- Each endpoint caches its current interest mask; `EPOLL_CTL_MOD` is issued only
-  when the mask changes.
-- After EOF, the completed read direction is removed from `EPOLLRDHUP` interest
-  while the other direction may continue forwarding.
-- A client FIN received during a nonblocking upstream connect is propagated
-  only after connect completion and after buffered client data drains.
-- An inactive half-close is reclaimed after 120 seconds. Probe, connect, and
-  half-close scans run at most once every 100 ms.
-- Linux controls TCP receive and send socket buffers through autotuning.
+  in the same callback. `EPOLLOUT` stays armed for unsent bytes. Draining a
+  full read buffer forces an edge-triggered readiness recheck even if the
+  interest mask stayed the same.
+- EOF removes read interest from that direction. Vane relays the FIN after
+  upstream connect and after queued bytes drain. The reverse direction can
+  remain active.
+- The 120-second idle timer starts at the first EOF and refreshes on another
+  EOF or successful I/O. Deadline scans are spaced at least 100 ms apart.
+- Linux autotunes the TCP socket buffers.
 
 ## UDP modules
 
@@ -59,11 +43,11 @@ PROBING -> CONNECTING -> RELAYING -> HALF_CLOSED -> FREE
   fallback.
 
 An `EINVAL`, `EMSGSIZE`, or unsupported-offload result disables GSO on the
-affected upstream flow (or public worker socket) before individual-datagram
-fallback. Downstream datagrams continue to use sendmmsg when GSO is disabled.
-Partial batch sends advance only completed messages; the remaining batch is
-retried to observe its actual error. `ENOBUFS` is treated as backpressure and is
-not expanded into a retry burst.
+affected upstream flow or public worker socket. Vane sends the unsent portion
+as individual datagrams, including any short tail. UDP PROXY v2 adds one
+header per original datagram. Downstream still uses `sendmmsg`, advancing by
+the count of completed messages before retrying the remainder. Backpressure
+such as `ENOBUFS` stops that send attempt.
 
 Recoverable upstream receive errors do not imply an empty payload queue. The
 worker continues receiving within the turn budget; after eight recoverable
@@ -83,12 +67,6 @@ address. Every active flow owns one connected upstream UDP socket. The open
 addressing hash table and fixed slab are separate. Deletion uses backward-shift
 compaction, and epoll tokens contain a flow ID and generation.
 
-```text
-PENDING -> ACTIVE(unconfirmed) -> ACTIVE(confirmed) -> QUIESCENT
-                 |                    |
-                 +---- REPROBING <----+
-```
-
 - `PENDING`: waits for bounded QUIC Initial parsing before an upstream socket
   exists.
 - `ACTIVE(unconfirmed)`: packets were forwarded, but no upstream response has
@@ -99,10 +77,9 @@ PENDING -> ACTIVE(unconfirmed) -> ACTIVE(confirmed) -> QUIESCENT
   only matching candidate long-header packets are buffered while established
   traffic continues on the old path. Other new Initial candidates are dropped
   until the current bounded side probe completes or is cancelled.
-- `QUIESCENT`: a confirmed flow passed the short idle threshold. Only the state
-  changes; the socket remains open and connected.
-- Traffic in either direction refreshes `last_activity_ms`. A quiescent flow
-  resumes on the same file descriptor.
+- `QUIESCENT`: a confirmed flow has been idle for three minutes. Traffic in
+  either direction refreshes activity. A quiescent flow resumes on the same
+  socket and source port while it remains in the table.
 - QUIC version plus both connection IDs identify the active Initial context.
   The first server Retry and the first server Initial are observed on the
   connected upstream path. Their Source Connection IDs are accepted as client
@@ -134,19 +111,9 @@ PENDING -> ACTIVE(unconfirmed) -> ACTIVE(confirmed) -> QUIESCENT
 ## Two-tier capacity
 
 The global UDP base capacity is 4096 and is sharded across UDP listener workers.
-Every worker reserves metadata for twice its base share at startup. Runtime
-capacity switches only between:
-
-```text
-base limit <-> burst limit (base x 2)
-```
-
-Built-in watermarks are:
-
-```text
-high = 80%
-low  = 65%
-```
+Every worker reserves metadata for twice its base share at startup, for a
+global burst capacity of 8192. Both tiers use an 80% high watermark and a 65%
+low watermark.
 
 At the current tier's high watermark, Vane collects eligible expired or idle
 candidates, orders them from least recently active to most recently active, and
@@ -155,54 +122,34 @@ the base limit, if usage remains above the base-tier low watermark after this
 reclamation pass, the logical admission limit switches to the burst tier. It
 returns to the base tier after usage falls to the base-tier low watermark.
 
-Returning to the base tier changes only the logical admission limit. Existing
-flows are not moved, closed, or reconnected. At a full burst tier with no
-reclaimable flow, new flows are rejected and established paths are preserved.
+Returning to the base tier lowers the admission limit and preserves existing
+flows. A full burst tier rejects new flows when none can be reclaimed.
 
 ## Data paths
 
-Public admission is level-triggered and processed in a bounded quantum per
-event-loop turn. Established upstream sockets remain edge-triggered. Upstream UDP receives
-yield at a bounded quantum and explicitly recheck readiness; TCP reads are
-bounded by their directional buffer. These are scheduling quanta, not sustained
-traffic rate limits. The public boundary also yields under admission storms.
+Public listeners use level-triggered epoll so they can yield after bounded
+work. Established TCP and upstream UDP sockets use edge-triggered epoll.
 
-Public to upstream:
-
-```text
-recvmmsg
- -> PKTINFO + TOS/TCLASS + UDP_GRO
- -> flow lookup / QUIC probe
- -> connected upstream socket
- -> UDP_SEGMENT or per-datagram fallback
-```
-
-Upstream to public:
-
-```text
-upstream EPOLLIN
- -> recvmsg + UDP_GRO
- -> downstream batch
- -> sendmmsg
- -> optional UDP_SEGMENT
-```
+| UDP direction | Receive | Forward |
+|---|---|---|
+| Public to upstream | `recvmmsg` collects payload, destination IP, traffic class, and GRO metadata | Look up the flow, probe when needed, and send on the connected UDP socket |
+| Upstream to public | `recvmsg` reads into a downstream batch slot | `sendmmsg` uses the original public IP as the source and preserves traffic class |
 
 ## Protocol boundary
 
-Vane passively parses TLS ClientHello, QUIC v1/v2 Initial packets, CRYPTO
-reassembly, SNI routing, and PROXY v2. It does not send QUIC acknowledgements,
-perform congestion control, or maintain a complete QUIC endpoint.
+Vane reads TLS ClientHello directly from TCP or reassembles it from QUIC v1
+and v2 Initial CRYPTO frames. The selected upstream handles the handshake and
+transport state.
 
 Protection keys derived from a QUIC Initial DCID, packet-number reconstruction
 state, and decrypted Initial payloads are retained only for the lifetime of one
 bounded pending probe. Each newly received Initial datagram is decrypted once;
 subsequent datagrams reuse the same protection and packet-number state, while
 CRYPTO frames are extracted only from newly decrypted payloads. Their indexed
-views refer to the retained payloads, and the bounded assembly buffer is reused
-for the contiguous prefix. Known frames are still sorted and copied for each
-feed; this is not a fully incremental QUIC stream receiver. Every contiguous
-overlap in the received batch is checked before ClientHello is accepted. Client Initial
-datagrams smaller than 1200 bytes are rejected before key derivation.
+views refer to the retained payloads. Each feed sorts the known frames and
+checks overlaps while reusing the bounded buffer for the contiguous prefix.
+Client Initial datagrams smaller than 1200 bytes are rejected before key
+derivation.
 
 An in-memory flow and its upstream source port disappear after process restart,
 flow replacement, a confirmed-flow hard-idle deletion, capacity-pressure

@@ -231,6 +231,7 @@ static bool append_cmsg(struct msghdr *msg, size_t control_cap,
     size_t used = msg->msg_controllen;
     size_t space = CMSG_SPACE(data_len);
     if (used > control_cap || space > control_cap - used) {
+        errno = ENOSPC;
         vane_error_set(err, "UDP ancillary data buffer is too small");
         return false;
     }
@@ -317,7 +318,6 @@ ssize_t vane_udp_sendmsg(int fd, int family,
     } control;
     struct msghdr msg;
     memset(&msg, 0, sizeof(msg));
-    memset(&control, 0, sizeof(control));
     msg.msg_iov = (struct iovec *)(uintptr_t)iov;
     msg.msg_iovlen = iov_count;
     if (peer != NULL) {

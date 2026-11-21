@@ -52,7 +52,11 @@ def run(binary, mode, count_syscalls=False):
                     times=[]
                     for i in range(5200):
                         start=time.perf_counter_ns();client.sendall(b'x'*64);got=0
-                        while got<64:got+=len(client.recv(64-got))
+                        while got < 64:
+                            data = client.recv(64 - got)
+                            if not data:
+                                raise RuntimeError("short ping response")
+                            got += len(data)
                         if i>=200:times.append((time.perf_counter_ns()-start)/1000)
                     times.sort();result={'p50_us':statistics.median(times),'p99_us':times[int(len(times)*.99)]}
             t.join(3)

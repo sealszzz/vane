@@ -7,7 +7,7 @@
 #include <string.h>
 
 enum send_mode { SEND_OK, GSO_FAIL, PLAIN_FAIL, PARTIAL_BACKPRESSURE,
-                 PARTIAL_GSO_FAIL };
+                 PARTIAL_GSO_FAIL, UPSTREAM_GSO_FAIL };
 static enum send_mode mode;
 static size_t mmsg_calls, msg_calls, delivered;
 static size_t lengths[128];
@@ -58,8 +58,23 @@ int __wrap_sendmmsg(int fd, struct mmsghdr *messages, unsigned int count, int fl
 }
 
 ssize_t __wrap_sendmsg(int fd, const struct msghdr *message, int flags) {
-    VANE_UNUSED(fd); VANE_UNUSED(message); VANE_UNUSED(flags);
+    VANE_UNUSED(fd); VANE_UNUSED(flags);
     msg_calls++;
+    if (mode == UPSTREAM_GSO_FAIL) {
+        struct msghdr header = *message;
+        if (msg_calls == 1U) {
+            assert(message_has_gso(&header));
+            errno = EOPNOTSUPP;
+            return -1;
+        }
+        assert(!message_has_gso(&header));
+        size_t len = 0U;
+        for (size_t i = 0; i < message->msg_iovlen; i++)
+            len += message->msg_iov[i].iov_len;
+        assert(delivered < VANE_ARRAY_LEN(lengths));
+        lengths[delivered++] = len;
+        return (ssize_t)len;
+    }
     errno = EIO;
     return -1;
 }
@@ -97,12 +112,30 @@ static void destroy_worker(struct udp_worker *worker) {
     free(worker->tx_controls); free(worker->down_storage);
 }
 
+static void test_upstream_fallback(struct udp_flow *flow, bool proxy) {
+    struct vane_target_config target = {
+        .location = flow->key.local,
+        .proxy_protocol = proxy,
+    };
+    const uint16_t segment = 1000U;
+    const size_t header = proxy ? 28U : 0U;
+    uint8_t data[64300] = {0};
+    flow->gso_enabled = true;
+    flow->target = &target;
+    reset_sender(UPSTREAM_GSO_FAIL);
+    assert(udp_send_upstream_aggregate(flow, data, sizeof(data), segment, 0U, false));
+    assert(!flow->gso_enabled && delivered == 65U);
+    for (size_t i = 0; i < delivered - 1U; i++)
+        assert(lengths[i] == segment + header);
+    assert(lengths[delivered - 1U] == 300U + header);
+    flow->target = NULL;
+}
+
 int main(void) {
     assert(udp_gso_error_disables(EINVAL));
     assert(udp_gso_error_disables(EMSGSIZE));
     assert(udp_gso_error_disables(ENOPROTOOPT));
-    assert(udp_gso_error_allows_fallback(EINVAL));
-    assert(!udp_gso_error_allows_fallback(ENOBUFS));
+    assert(!udp_gso_error_disables(ENOBUFS));
     assert(!udp_gso_error_disables(EAGAIN));
     struct udp_worker worker;
     struct vane_worker_args args;
@@ -163,6 +196,8 @@ int main(void) {
     assert(lengths[0] == 50U && lengths[1] == 1200U &&
            lengths[2] == 1200U && lengths[3] == 100U);
     assert(msg_calls == 0U && worker.down_count == 0U);
+    test_upstream_fallback(&flow, false);
+    test_upstream_fallback(&flow, true);
     destroy_worker(&worker);
     return 0;
 }

@@ -16,18 +16,6 @@ bool udp_gso_error_disables(int error_number) {
            error_number == EOPNOTSUPP || error_number == ENOSYS;
 }
 
-bool udp_gso_error_allows_fallback(int error_number) {
-    /* ENOBUFS is backpressure, not an offload-compatibility failure.  Retrying
-     * the same train as individual datagrams only adds work while the socket
-     * is already full. */
-    return udp_gso_error_disables(error_number);
-}
-
-static bool send_upstream_individual(struct udp_flow *flow,
-                                     const uint8_t *data, size_t len,
-                                     uint16_t segment_size,
-                                     uint8_t tclass, bool has_tclass);
-
 static bool prepare_down_message(struct udp_worker *worker, size_t index,
                                  const struct udp_down_item *item,
                                  size_t offset, size_t len, bool use_gso) {
@@ -35,7 +23,6 @@ static bool prepare_down_message(struct udp_worker *worker, size_t index,
     struct iovec *iov = &worker->tx_iov[index];
     unsigned char *control = worker->tx_controls + index * VANE_UDP_CONTROL_SIZE;
     memset(mmsg, 0, sizeof(*mmsg));
-    memset(control, 0, VANE_UDP_CONTROL_SIZE);
     iov->iov_base = item->data + offset;
     iov->iov_len = len;
     mmsg->msg_hdr.msg_name = (void *)(uintptr_t)&item->peer.storage;
@@ -45,10 +32,9 @@ static bool prepare_down_message(struct udp_worker *worker, size_t index,
     mmsg->msg_hdr.msg_control = control;
     const uint8_t *tclass = item->has_tclass ? &item->tclass : NULL;
     const uint16_t *segment = use_gso ? &item->segment_size : NULL;
-    struct vane_error err = {0};
     return vane_udp_set_ancillary(&mmsg->msg_hdr, VANE_UDP_CONTROL_SIZE,
                                     vane_addr_effective_family(&item->peer),
-                                    &item->local, tclass, segment, &err);
+                                    &item->local, tclass, segment, NULL);
 }
 
 void udp_downstream_flush(struct udp_worker *worker) {
@@ -182,87 +168,82 @@ void udp_downstream_queue(struct udp_worker *worker,
     }
 }
 
-static bool send_plain_train(const struct udp_flow *flow,
-                             const uint8_t *data, size_t len,
-                             uint16_t segment_size, bool use_gso,
-                             uint8_t tclass, bool has_tclass,
-                             struct vane_error *err) {
-    struct iovec iov = {.iov_base = (void *)(uintptr_t)data, .iov_len = len};
-    const uint8_t *tc = has_tclass ? &tclass : NULL;
-    const uint16_t *seg = use_gso ? &segment_size : NULL;
+static bool send_upstream_message(const struct udp_flow *flow,
+                                  const struct iovec *iov, size_t count,
+                                  size_t expected, uint8_t tclass,
+                                  bool has_tclass, const uint16_t *segment) {
     int family = vane_addr_effective_family(&flow->target->location);
-    ssize_t n = vane_udp_sendmsg(flow->upstream_fd, family, &iov, 1,
-                               NULL, NULL, tc, seg, err);
-    if (n == (ssize_t)len) return true;
-    if (n >= 0) errno = EIO;
-    return false;
-}
-
-static bool send_proxy_train(const struct udp_flow *flow,
-                             const uint8_t *data, size_t len,
-                             uint16_t segment_size, bool use_gso,
-                             uint8_t tclass, bool has_tclass,
-                             struct vane_error *err) {
-    struct vane_proxy_header header;
-    if (!vane_proxy_v2_encode(&flow->key.client, &flow->key.local,
-                                VANE_PROXY_DGRAM, &header, err)) return false;
-    int family = vane_addr_effective_family(&flow->target->location);
-    if (len == 0U) {
-        struct iovec iov = {.iov_base = header.bytes, .iov_len = header.len};
-        const uint8_t *tc = has_tclass ? &tclass : NULL;
-        ssize_t sent = vane_udp_sendmsg(flow->upstream_fd, family,
-                                          &iov, 1, NULL, NULL, tc, NULL, err);
-        if (sent == (ssize_t)header.len) return true;
-        if (sent >= 0) errno = EIO;
-        return false;
-    }
-    if (segment_size == 0U) {
-        errno = EINVAL;
-        vane_error_set(err, "UDP segment size is zero");
-        return false;
-    }
-    size_t count = (len + segment_size - 1U) / segment_size;
-    if (count > UDP_GSO_MAX_SEGMENTS) {
-        errno = EMSGSIZE;
-        vane_error_set(err, "UDP GSO train exceeds the segment limit");
-        return false;
-    }
-    struct iovec iov[UDP_GSO_MAX_SEGMENTS * 2U];
-    size_t offset = 0, iov_count = 0, expected = 0;
-    while (offset < len) {
-        size_t n = VANE_MIN((size_t)segment_size, len - offset);
-        iov[iov_count++] = (struct iovec){.iov_base = header.bytes, .iov_len = header.len};
-        iov[iov_count++] = (struct iovec){
-            .iov_base = (void *)(uintptr_t)(data + offset),
-            .iov_len = n,
-        };
-        expected += header.len + n;
-        offset += n;
-    }
-    size_t wire_size = header.len + segment_size;
-    if (use_gso && wire_size > UINT16_MAX) {
-        errno = EMSGSIZE;
-        vane_error_set(err, "UDP PROXY segment exceeds UINT16_MAX");
-        return false;
-    }
-    uint16_t wire_segment = (uint16_t)wire_size;
-    const uint8_t *tc = has_tclass ? &tclass : NULL;
-    const uint16_t *seg = use_gso ? &wire_segment : NULL;
-    ssize_t sent = vane_udp_sendmsg(flow->upstream_fd, family,
-                                      iov, iov_count, NULL, NULL, tc, seg, err);
+    ssize_t sent = vane_udp_sendmsg(flow->upstream_fd, family, iov, count,
+                                      NULL, NULL, has_tclass ? &tclass : NULL,
+                                      segment, NULL);
     if (sent == (ssize_t)expected) return true;
     if (sent >= 0) errno = EIO;
     return false;
 }
 
-static bool send_upstream_views_individual(struct udp_flow *flow,
+static bool encode_upstream_proxy(const struct udp_flow *flow,
+                                 struct vane_proxy_header *header) {
+    if (vane_proxy_v2_encode(&flow->key.client, &flow->key.local,
+                                VANE_PROXY_DGRAM, header, NULL))
+        return true;
+    errno = EAFNOSUPPORT;
+    return false;
+}
+
+static bool send_upstream_datagram(const struct udp_flow *flow,
+                                   const uint8_t *data, size_t len,
+                                   uint8_t tclass, bool has_tclass) {
+    struct iovec iov[2];
+    struct vane_proxy_header header;
+    size_t count = 0U, expected = len;
+    if (flow->target->proxy_protocol) {
+        if (!encode_upstream_proxy(flow, &header)) return false;
+        iov[count++] = (struct iovec){.iov_base = header.bytes, .iov_len = header.len};
+        expected += header.len;
+    }
+    iov[count++] = (struct iovec){.iov_base = (void *)(uintptr_t)data, .iov_len = len};
+    return send_upstream_message(flow, iov, count, expected, tclass, has_tclass, NULL);
+}
+
+static bool send_upstream_train(const struct udp_flow *flow,
+                                const uint8_t *data, size_t len,
+                                uint16_t segment_size,
+                                uint8_t tclass, bool has_tclass) {
+    if (!flow->target->proxy_protocol) {
+        struct iovec iov = {.iov_base = (void *)(uintptr_t)data, .iov_len = len};
+        return send_upstream_message(flow, &iov, 1U, len, tclass, has_tclass,
+                                     &segment_size);
+    }
+
+    struct vane_proxy_header header;
+    if (!encode_upstream_proxy(flow, &header)) return false;
+    size_t wire_size = header.len + segment_size;
+    if (wire_size > UINT16_MAX) {
+        errno = EMSGSIZE;
+        return false;
+    }
+    uint16_t wire_segment = (uint16_t)wire_size;
+    struct iovec iov[UDP_GSO_MAX_SEGMENTS * 2U];
+    size_t offset = 0U, count = 0U, expected = len;
+    while (offset < len) {
+        size_t n = VANE_MIN((size_t)segment_size, len - offset);
+        iov[count++] = (struct iovec){.iov_base = header.bytes, .iov_len = header.len};
+        iov[count++] = (struct iovec){.iov_base = (void *)(uintptr_t)(data + offset),
+                                      .iov_len = n};
+        expected += header.len;
+        offset += n;
+    }
+    return send_upstream_message(flow, iov, count, expected, tclass, has_tclass,
+                                 &wire_segment);
+}
+
+static bool send_upstream_views_individual(const struct udp_flow *flow,
                                            const uint8_t *const *packets,
                                            size_t count, size_t segment_size,
                                            uint8_t tclass, bool has_tclass) {
     for (size_t i = 0; i < count; i++) {
-        if (!send_upstream_individual(flow, packets[i], segment_size,
-                                      (uint16_t)segment_size,
-                                      tclass, has_tclass))
+        if (!send_upstream_datagram(flow, packets[i], segment_size,
+                                       tclass, has_tclass))
             return false;
     }
     return true;
@@ -284,15 +265,13 @@ bool udp_send_upstream_views(struct udp_flow *flow,
         return send_upstream_views_individual(flow, packets, count, segment_size,
                                               tclass, has_tclass);
 
-    struct vane_error err = {0};
     struct iovec iov[UDP_GSO_MAX_SEGMENTS * 2U];
     struct vane_proxy_header header;
     size_t iov_count = 0U;
     size_t expected = 0U;
     uint16_t wire_segment = (uint16_t)segment_size;
     if (flow->target->proxy_protocol) {
-        if (!vane_proxy_v2_encode(&flow->key.client, &flow->key.local,
-                                    VANE_PROXY_DGRAM, &header, &err))
+        if (!encode_upstream_proxy(flow, &header))
             return false;
         size_t wire_size = header.len + segment_size;
         if (wire_size > UINT16_MAX) {
@@ -318,48 +297,23 @@ bool udp_send_upstream_views(struct udp_flow *flow,
         count > UDP_GSO_SAFE_BYTES / (size_t)wire_segment)
         return send_upstream_views_individual(flow, packets, count, segment_size,
                                               tclass, has_tclass);
-    const uint8_t *tc = has_tclass ? &tclass : NULL;
-    int family = vane_addr_effective_family(&flow->target->location);
-    ssize_t sent = vane_udp_sendmsg(flow->upstream_fd, family,
-                                      iov, iov_count, NULL, NULL, tc, &wire_segment, &err);
-    if (sent == (ssize_t)expected) return true;
-
-    int saved = sent >= 0 ? EIO : errno;
-    if (udp_gso_error_disables(saved)) flow->gso_enabled = false;
-    if (udp_gso_error_allows_fallback(saved))
-        return send_upstream_views_individual(flow, packets, count, segment_size,
-                                              tclass, has_tclass);
-    errno = saved;
-    return false;
+    if (send_upstream_message(flow, iov, iov_count, expected, tclass, has_tclass,
+                                  &wire_segment))
+        return true;
+    if (!udp_gso_error_disables(errno)) return false;
+    flow->gso_enabled = false;
+    return send_upstream_views_individual(flow, packets, count, segment_size,
+                                          tclass, has_tclass);
 }
 
-static bool send_upstream_individual(struct udp_flow *flow,
+static bool send_upstream_individual(const struct udp_flow *flow,
                                      const uint8_t *data, size_t len,
                                      uint16_t segment_size,
                                      uint8_t tclass, bool has_tclass) {
-    if (len == 0U) {
-        struct vane_error err = {0};
-        return flow->target->proxy_protocol
-            ? send_proxy_train(flow, data, 0U, 0U, false, tclass, has_tclass, &err)
-            : send_plain_train(flow,
-                               data, 0U, 0U, false,
-                               tclass, has_tclass, &err);
-    }
-    if (segment_size == 0U) {
-        errno = EINVAL;
-        return false;
-    }
-    size_t offset = 0;
-    while (offset < len) {
+    for (size_t offset = 0U; offset < len;) {
         size_t n = VANE_MIN((size_t)segment_size, len - offset);
-        struct vane_error err = {0};
-        bool ok = flow->target->proxy_protocol
-            ? send_proxy_train(flow, data + offset, n, (uint16_t)n, false,
-                               tclass, has_tclass, &err)
-            : send_plain_train(flow,
-                               data + offset, n,
-                               (uint16_t)n, false, tclass, has_tclass, &err);
-        if (!ok) return false;
+        if (!send_upstream_datagram(flow, data + offset, n, tclass, has_tclass))
+            return false;
         offset += n;
     }
     return true;
@@ -369,8 +323,6 @@ bool udp_send_upstream_aggregate(struct udp_flow *flow,
                                  const uint8_t *data, size_t len,
                                  uint16_t segment_size,
                                  uint8_t tclass, bool has_tclass) {
-    if (len == 0U)
-        return send_upstream_individual(flow, data, 0U, 0U, tclass, has_tclass);
     if (segment_size == 0U) {
         if (len > UINT16_MAX) {
             errno = EMSGSIZE;
@@ -378,47 +330,37 @@ bool udp_send_upstream_aggregate(struct udp_flow *flow,
         }
         segment_size = (uint16_t)len;
     }
-    if (segment_size == 0U) {
-        errno = EINVAL;
-        return false;
-    }
-    if (!flow->gso_enabled && len > segment_size)
+    if (len <= segment_size)
+        return send_upstream_datagram(flow, data, len, tclass, has_tclass);
+    if (!flow->gso_enabled)
         return send_upstream_individual(flow, data, len, segment_size,
                                         tclass, has_tclass);
+
     size_t header_len = flow->target->proxy_protocol
         ? (vane_addr_effective_family(&flow->key.client) == AF_INET ? 28U : 52U) : 0U;
-    size_t wire_segment = header_len + segment_size;
     size_t max_segments = VANE_MIN((size_t)UDP_GSO_MAX_SEGMENTS,
-                                     UDP_GSO_SAFE_BYTES / VANE_MAX(wire_segment, 1U));
-    if (max_segments == 0) max_segments = 1;
-    size_t offset = 0;
-    while (offset < len) {
+                                     UDP_GSO_SAFE_BYTES / (header_len + segment_size));
+    if (max_segments < 2U)
+        return send_upstream_individual(flow, data, len, segment_size,
+                                        tclass, has_tclass);
+
+    for (size_t offset = 0U; offset < len;) {
         size_t remaining = len - offset;
-        size_t full = remaining / segment_size;
-        size_t segments = VANE_MIN(full, max_segments);
-        size_t train_len;
-        if (segments == 0) train_len = remaining;
-        else {
-            train_len = segments * segment_size;
-            if (train_len < remaining && segments < max_segments &&
-                remaining - train_len < segment_size) train_len = remaining;
+        if (remaining <= segment_size)
+            return send_upstream_datagram(flow, data + offset, remaining,
+                                          tclass, has_tclass);
+        size_t segments = VANE_MIN(remaining / segment_size, max_segments);
+        size_t train_len = segments * segment_size;
+        if (segments < max_segments && remaining - train_len < segment_size)
+            train_len = remaining;
+        if (!send_upstream_train(flow, data + offset, train_len, segment_size,
+                                 tclass, has_tclass)) {
+            if (!udp_gso_error_disables(errno)) return false;
+            flow->gso_enabled = false;
+            /* Split the entire unsent suffix when offload is disabled. */
+            return send_upstream_individual(flow, data + offset, remaining,
+                                            segment_size, tclass, has_tclass);
         }
-        bool use_gso = flow->gso_enabled && train_len > segment_size;
-        struct vane_error err = {0};
-        bool ok = flow->target->proxy_protocol
-            ? send_proxy_train(flow, data + offset, train_len, segment_size,
-                               use_gso, tclass, has_tclass, &err)
-            : send_plain_train(flow,
-                               data + offset, train_len,
-                               segment_size, use_gso, tclass, has_tclass, &err);
-        if (!ok && use_gso) {
-            int saved = errno;
-            if (udp_gso_error_disables(saved)) flow->gso_enabled = false;
-            if (udp_gso_error_allows_fallback(saved))
-                ok = send_upstream_individual(flow, data + offset, train_len,
-                                              segment_size, tclass, has_tclass);
-        }
-        if (!ok) return false;
         offset += train_len;
     }
     return true;

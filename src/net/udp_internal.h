@@ -185,7 +185,6 @@ static inline void udp_flow_clear_error_history(struct udp_flow *flow) {
 }
 
 bool udp_gso_error_disables(int error_number);
-bool udp_gso_error_allows_fallback(int error_number);
 
 /* Flow table and active-flow lifecycle. */
 bool udp_flow_key_equal(const struct udp_flow_key *a,

@@ -38,6 +38,33 @@ static void test_buffer_limit(void) {
     close(pair[1]);
 }
 
+static void test_half_close_after_idle(void) {
+    const uint64_t timeout = 120000U;
+    int pair[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, pair) == 0);
+    struct tcp_connection connection = {
+        .state = CONN_RELAYING, .client_fd = pair[1], .upstream_fd = -1,
+        .half_close_activity_ms = vane_monotonic_ms() - timeout,
+    };
+    struct vane_runtime_config runtime = {.tcp_half_close_idle_timeout_ms = timeout};
+    struct vane_worker_args args = {.runtime = &runtime};
+    uint32_t free_id;
+    struct tcp_worker worker = {
+        .args = &args, .epoll_fd = -1, .capacity = 1U,
+        .connections = &connection, .free_ids = &free_id,
+    };
+    buffer_init(&connection.c2u, TCP_BUFFER_INITIAL, NULL);
+    assert(shutdown(pair[0], SHUT_WR) == 0);
+    assert(connection_read(&connection, &connection.c2u, pair[1],
+                            &connection.client_eof));
+    assert(connection.client_eof);
+    expire_connections(&worker, vane_monotonic_ms());
+    assert(connection.state == CONN_RELAYING);
+    expire_connections(&worker, connection.half_close_activity_ms + timeout);
+    assert(connection.state == CONN_FREE);
+    close(pair[0]);
+}
+
 static void test_probe_transition(bool proxy, bool tls) {
     int backend = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     struct sockaddr_in address = {
@@ -80,10 +107,27 @@ static void test_probe_transition(bool proxy, bool tls) {
         .relay_max = TCP_BUFFER_INITIAL, .u2c_max = TCP_BUFFER_INITIAL,
     };
     assert(worker.epoll_fd >= 0);
-    int pair[2];
-    assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, pair) == 0);
-    assert(allocate_connection(&worker, pair[1], &targets[1].location,
-                               &targets[1].location));
+    int listener_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_in bound = {
+        .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+    };
+    assert(listener_fd >= 0);
+    assert(bind(listener_fd, (const struct sockaddr *)&bound, sizeof(bound)) == 0);
+    assert(listen(listener_fd, 1) == 0);
+    socklen_t bound_len = sizeof(bound);
+    assert(getsockname(listener_fd, (struct sockaddr *)&bound, &bound_len) == 0);
+    int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    assert(client >= 0);
+    assert(connect(client, (const struct sockaddr *)&bound, bound_len) == 0);
+    socklen_t peer_len = sizeof(storage);
+    int accepted = accept4(listener_fd, (struct sockaddr *)&storage, &peer_len,
+                           SOCK_NONBLOCK | SOCK_CLOEXEC);
+    assert(accepted >= 0);
+    close(listener_fd);
+    struct vane_addr peer_addr;
+    assert(vane_addr_from_sockaddr((const struct sockaddr *)&storage, peer_len,
+                                   &peer_addr));
+    assert(allocate_connection(&worker, accepted, &peer_addr));
     uint8_t data[VANE_TLS_HANDSHAKE_MAX_SIZE + 4096U];
     memset(data, 'X', sizeof(data));
     if (tls) {
@@ -94,7 +138,7 @@ static void test_probe_transition(bool proxy, bool tls) {
         hello[48] = 1U;
         memcpy(data, hello, sizeof(hello));
     }
-    assert(send(pair[0], data, sizeof(data), 0) == (ssize_t)sizeof(data));
+    assert(send(client, data, sizeof(data), 0) == (ssize_t)sizeof(data));
     struct epoll_event event;
     assert(epoll_wait(worker.epoll_fd, &event, 1, 100) == 1);
     assert(token_kind(event.data.u64) == TCP_EVENT_CLIENT);
@@ -123,7 +167,7 @@ static void test_probe_transition(bool proxy, bool tls) {
     for (size_t i = 0; i < worker.buffer_cache.count; i++)
         free(worker.buffer_cache.blocks[i]);
     close(worker.epoll_fd);
-    close(pair[0]);
+    close(client);
     if (peer >= 0) close(peer);
     close(backend);
     vane_route_table_destroy(routes);
@@ -138,7 +182,8 @@ int main(int argc, char **argv) {
         test_probe_transition(false, true);
         test_probe_transition(true, true);
         test_buffer_limit();
+        test_half_close_after_idle();
     }
-    puts("TCP probe transition and logical buffer limit passed");
+    puts("TCP relay progress checks passed");
     return 0;
 }
