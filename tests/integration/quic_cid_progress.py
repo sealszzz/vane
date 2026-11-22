@@ -17,7 +17,7 @@ def with_leading_packet(initial, first_byte, dcid, scid):
 
 
 def run(binary, version, retry, *, negotiated_version=None, grease_bit=False,
-        coalesced=False):
+        coalesced=False, zero_scid=False):
     public = smoke.reserve_port(socket.SOCK_DGRAM)
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as backend, \
          socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
@@ -31,6 +31,8 @@ def run(binary, version, retry, *, negotiated_version=None, grease_bit=False,
                         {"location": "drop", "sni": ["none", "any"]}],
         }]}
         dcid, scid, retry_cid, server_cid = (bytes([i]) * 8 for i in range(1, 5))
+        if zero_scid:
+            scid = b""
         target = ("127.0.0.1", public)
         with maintenance.instance(binary, config):
             cached_token = b"cached-token" if grease_bit else b""
@@ -82,6 +84,16 @@ def run(binary, version, retry, *, negotiated_version=None, grease_bit=False,
                 maintenance.send_burst(client, public, [continuation, continuation], gso)
                 for _ in range(2):
                     assert backend.recvfrom(65535) == (continuation, peer)
+            # NEW_CONNECTION_ID can be encrypted inside the server flight.
+            # The client may use it for a datagram carrying its Initial ACK,
+            # whose packet protection still uses the established Initial key.
+            rotated = smoke.make_quic_initial(
+                "cid.test", server_version, dcid=b"\x05" * 8, scid=scid,
+                initial_dcid=key_dcid, packet_number=2,
+                crypto_frames=b"\x02\x00\x00\x00\x00",
+                token=b"token" if retry else cached_token)
+            client.sendto(rotated, target)
+            assert backend.recvfrom(65535) == (rotated, peer)
             # An unobserved DCID with the same client SCID is still a candidate,
             # and cannot bypass classification just because a server CID is known.
             denied = smoke.make_quic_initial("denied.test", server_version,
@@ -132,5 +144,6 @@ if __name__ == "__main__":
         run(binary, version, False, grease_bit=True)
         run(binary, version, False, negotiated_version=3 - version)
         run(binary, version, False, coalesced=True)
+        run(binary, version, False, zero_scid=True)
     run_same_upstream(binary)
-    print("QUIC CID progress passed (Retry, greasing, coalescing, v1/v2 switch, same upstream)")
+    print("QUIC CID progress passed (Retry, greasing, coalescing, CID rotation, v1/v2 switch, same upstream)")

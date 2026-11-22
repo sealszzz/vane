@@ -86,8 +86,10 @@ compaction, and epoll tokens contain a flow ID and generation.
   Initial destination IDs with the original client SCID. The Retry alias
   requires the original version; the Initial alias uses the observed version,
   including a compatible v1/v2 switch. Both aliases remain valid for reordering
-  and later conflicting observations are ignored. An unobserved DCID still
-  requires a side probe. These observations are used only for routing.
+  and later conflicting observations are ignored. When the client SCID and
+  observed version match, control-only Initials with a rotated DCID can
+  continue on the same upstream using the original or Retry Initial keys.
+  New ClientHellos with an unobserved DCID go through a side probe.
 - If reprobe selects the same upstream address and PROXY v2 setting, the
   connected socket, source port, and confirmation state are retained. If it
   selects a different upstream or framing mode, Vane opens,

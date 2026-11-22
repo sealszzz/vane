@@ -72,6 +72,10 @@ static void test_real_nextquic_initial(void) {
     assert(identity1.version == UINT32_C(1));
     assert(identity1.source_connection_id_len > 0U);
     assert(vane_quic_initial_identity_equal(&identity1, &identity2));
+    const struct vane_datagram_view key_dcid = {
+        identity1.destination_connection_id, identity1.destination_connection_id_len
+    };
+    assert(!vane_quic_is_initial_control(packets[0], lengths[0], &key_dcid));
 
     uint8_t *zero_rtt = malloc(lengths[0]);
     assert(zero_rtt != NULL);

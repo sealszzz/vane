@@ -430,6 +430,7 @@ static bool collect_datagram(const uint8_t *data, size_t len,
                              size_t *capacity, bool *have_largest,
                              uint64_t *largest,
                              struct protection_cache *key_cache,
+                             const struct vane_datagram_view *key_dcid,
                              struct vane_error *err) {
     size_t pos = 0;
     bool ok = false;
@@ -466,7 +467,10 @@ static bool collect_datagram(const uint8_t *data, size_t len,
         }
         size_t packet_end = pos + protected_len;
         size_t pn_offset = pos - packet_start;
-        if (!protection_cache_refresh(key_cache, version, dcid, dcid_len, err))
+        if (!protection_cache_refresh(key_cache, version,
+                                        key_dcid != NULL ? key_dcid->data : dcid,
+                                        key_dcid != NULL ? key_dcid->len : dcid_len,
+                                        err))
             goto done;
         struct initial_packet packet = {
             .version = version, .dcid = dcid, .dcid_len = dcid_len,
@@ -557,6 +561,8 @@ static bool extract_frames(const uint8_t *payload, size_t len,
             continue;
         }
         if (type == 0x06U) {
+            /* A control-only check rejects CRYPTO without collecting it. */
+            if (frames == NULL) return false;
             size_t offset = 0, data_len = 0;
             if (!read_varint(payload, len, &pos, &offset) ||
                 !read_varint(payload, len, &pos, &data_len) || data_len > len - pos) {
@@ -588,6 +594,30 @@ static bool extract_frames(const uint8_t *payload, size_t len,
         return false;
     }
     return true;
+}
+
+bool vane_quic_is_initial_control(
+    const uint8_t *data, size_t len,
+    const struct vane_datagram_view *key_dcid) {
+    if (data == NULL || key_dcid == NULL || key_dcid->data == NULL ||
+        key_dcid->len > VANE_QUIC_MAX_CID_LEN ||
+        !check_client_initial_size(len, NULL))
+        return false;
+    struct initial_packet *packets = NULL;
+    size_t count = 0U, capacity = 0U;
+    bool have_largest = false;
+    uint64_t largest = 0U;
+    struct protection_cache keys = {0};
+    bool matched = collect_datagram(data, len, &packets, &count, &capacity,
+                                    &have_largest, &largest, &keys,
+                                    key_dcid, NULL) &&
+                   same_context(packets, count);
+    protection_cache_cleanse(&keys);
+    for (size_t i = 0U; matched && i < count; i++)
+        matched = extract_frames(packets[i].payload, packets[i].payload_len,
+                                  NULL, NULL, NULL, NULL);
+    free_packets(packets, count);
+    return matched;
 }
 
 static int frame_compare(const void *a, const void *b) {
@@ -796,7 +826,7 @@ vane_quic_probe_feed(struct vane_quic_probe_state *state,
     if (!collect_datagram(datagram, datagram_len,
                           &fresh, &fresh_count, &fresh_capacity,
                           &state->have_largest, &state->largest,
-                          &state->key_cache, err)) {
+                          &state->key_cache, NULL, err)) {
         free_packets(fresh, fresh_count);
         return VANE_PROBE_MALFORMED;
     }
@@ -854,7 +884,7 @@ vane_quic_parse_client_hello(const struct vane_datagram_view *datagrams,
         if (!check_client_initial_size(datagrams[i].len, err) ||
             !collect_datagram(datagrams[i].data, datagrams[i].len,
                               &packets, &packet_count, &packet_capacity,
-                              &have_largest, &largest, &key_cache, err)) {
+                              &have_largest, &largest, &key_cache, NULL, err)) {
             protection_cache_cleanse(&key_cache);
             free_packets(packets, packet_count);
             return VANE_PROBE_MALFORMED;

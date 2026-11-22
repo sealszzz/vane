@@ -2,6 +2,12 @@
 
 ## Current release
 
+- Keep control-only QUIC Initials on the established upstream when a client
+  uses a rotated destination connection ID. Check the packet against the
+  active Initial keys before forwarding the datagram.
+
+## Previous TCP and UDP forwarding fixes
+
 - Start the TCP half-close timer when FIN arrives, including after a long
   idle period. Read the clock for relay activity only after half-close and
   read the original destination address only for PROXY v2 targets.

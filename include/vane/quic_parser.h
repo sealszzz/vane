@@ -52,6 +52,10 @@ bool vane_quic_read_coalesced_initial_identity(
 bool vane_quic_read_initial_identity(
     const uint8_t *data, size_t len,
     struct vane_quic_initial_identity *identity);
+/* Check control-only client Initials against an existing Initial key DCID. */
+bool vane_quic_is_initial_control(
+    const uint8_t *data, size_t len,
+    const struct vane_datagram_view *key_dcid);
 bool vane_quic_initial_identity_equal(
     const struct vane_quic_initial_identity *a,
     const struct vane_quic_initial_identity *b);

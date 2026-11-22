@@ -15,6 +15,31 @@ static bool packet_matches_reprobe_candidate(
                                                &identity);
 }
 
+static bool packet_matches_active_initial(
+    const struct udp_flow *flow, const struct vane_quic_initial_identity *identity,
+    const uint8_t *data, size_t len) {
+    if (udp_flow_quic_identity_matches(flow, identity)) return true;
+    const struct vane_quic_initial_identity *original = &flow->quic_identity;
+    if (!flow->has_quic_server_dcid ||
+        flow->quic_server_version != identity->version ||
+        original->source_connection_id_len != identity->source_connection_id_len ||
+        memcmp(original->source_connection_id, identity->source_connection_id,
+               original->source_connection_id_len) != 0)
+        return false;
+
+    /* A rotated DCID can carry an Initial ACK protected with the keys
+     * derived from the first client Initial or the observed Retry. */
+    const struct vane_datagram_view original_key = {
+        original->destination_connection_id, original->destination_connection_id_len
+    };
+    if (vane_quic_is_initial_control(data, len, &original_key)) return true;
+    if (!flow->has_quic_retry_dcid) return false;
+    const struct vane_datagram_view retry_key = {
+        flow->quic_retry_dcid, flow->quic_retry_dcid_len
+    };
+    return vane_quic_is_initial_control(data, len, &retry_key);
+}
+
 static void append_probe_packet(struct udp_worker *worker, size_t id,
                                 const uint8_t *data, size_t len,
                                 uint8_t tclass, bool has_tclass) {
@@ -88,23 +113,24 @@ static void process_segment(struct udp_worker *worker,
             append_probe_packet(worker, id, data, len, tclass, has_tclass);
             return;
         }
+        bool active_initial = looks_initial &&
+                              packet_matches_active_initial(flow, &incoming,
+                                                              data, len);
         if (flow->state == UDP_FLOW_REPROBING) {
             bool candidate = looks_initial
                 ? vane_quic_initial_identity_equal(&flow->reprobe_identity,
                                                    &incoming)
                 : packet_matches_reprobe_candidate(flow, data, len);
-            if (candidate)
+            if (candidate && !active_initial)
                 append_probe_packet(worker, id, data, len, tclass, has_tclass);
-            else if (!looks_initial ||
-                     udp_flow_quic_identity_matches(flow, &incoming))
+            else if (!looks_initial || active_initial)
                 (void)udp_forward_upstream(worker, id, data, len,
                                            tclass, has_tclass);
             return;
         }
         if (flow->state == UDP_FLOW_ACTIVE ||
             flow->state == UDP_FLOW_QUIESCENT) {
-            if (looks_initial &&
-                !udp_flow_quic_identity_matches(flow, &incoming)) {
+            if (looks_initial && !active_initial) {
                 (void)begin_reprobe_for_packet(worker, id, &incoming,
                                                data, len, tclass, has_tclass);
                 return;
