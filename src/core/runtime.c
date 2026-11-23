@@ -6,6 +6,7 @@
 
 #include <pthread.h>
 #include <errno.h>
+#include <poll.h>
 #include <signal.h>
 #include <time.h>
 #include <stdlib.h>
@@ -66,28 +67,37 @@ static bool notify_ready(struct vane_error *err) {
     if (path == NULL || path[0] == '\0') return true;
     struct sockaddr_un address = {.sun_family = AF_UNIX};
     size_t len = strlen(path);
-    if ((path[0] != '/' && path[0] != '@') ||
-        len >= sizeof(address.sun_path)) {
+    bool abstract_socket = path[0] == '@';
+    if ((path[0] != '/' && !abstract_socket) ||
+        (abstract_socket ? len > sizeof(address.sun_path)
+                         : len >= sizeof(address.sun_path))) {
         vane_error_set(err, "invalid NOTIFY_SOCKET address");
         return false;
     }
-    memcpy(address.sun_path, path, len + 1U);
-    size_t address_len = offsetof(struct sockaddr_un, sun_path) + len + 1U;
-    if (path[0] == '@') {
+    if (abstract_socket) {
+        memcpy(address.sun_path, path, len);
         address.sun_path[0] = '\0';
-        address_len--;
+    } else {
+        memcpy(address.sun_path, path, len + 1U);
     }
+    size_t address_len = offsetof(struct sockaddr_un, sun_path) +
+                         (abstract_socket ? len : len + 1U);
     int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) {
         vane_error_set(err, "readiness socket: %s", strerror(errno));
         return false;
     }
     static const char message[] = "READY=1";
-    ssize_t sent;
-    do {
-        sent = sendto(fd, message, sizeof(message) - 1U, MSG_NOSIGNAL,
-                      (const struct sockaddr *)&address, (socklen_t)address_len);
-    } while (sent < 0 && errno == EINTR);
+    ssize_t sent = -1;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        do {
+            sent = sendto(fd, message, sizeof(message) - 1U, MSG_NOSIGNAL,
+                          (const struct sockaddr *)&address, (socklen_t)address_len);
+        } while (sent < 0 && errno == EINTR);
+        if (sent >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) break;
+        struct pollfd pfd = {.fd = fd, .events = POLLOUT};
+        if (poll(&pfd, 1, 200) <= 0) break;
+    }
     int saved = errno;
     close(fd);
     if (sent != (ssize_t)(sizeof(message) - 1U)) {
@@ -100,9 +110,6 @@ static bool notify_ready(struct vane_error *err) {
 
 bool vane_runtime_run(const struct vane_config *config,
                         struct vane_error *err) {
-#ifdef __GLIBC__
-    (void)mallopt(M_ARENA_MAX, 2);
-#endif
     struct vane_route_table **routes =
         calloc(config->listener_count, sizeof(*routes));
     if (routes == NULL) {

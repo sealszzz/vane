@@ -30,6 +30,12 @@ for root in text_roots:
             raise SystemExit(f"non-ASCII release text: {path.relative_to(ROOT)}") from exc
         # Treat VERSION as a dotted numeric token, not an arbitrary substring.
         # This avoids false positives such as the TEST-NET address 192.0.2.1.
+        if path == ROOT / "CHANGELOG.md":
+            # Release history is the one intentional exception: version
+            # headings belong here, not scattered through sources/configs.
+            if not re.search(rf"(?m)^## {re.escape(VERSION)}\s*$", text):
+                raise SystemExit("CHANGELOG.md must document VERSION as a heading")
+            continue
         if version_token.search(text):
             version_hits.append(str(path.relative_to(ROOT)))
 if version_hits:

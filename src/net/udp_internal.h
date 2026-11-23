@@ -19,8 +19,18 @@
 #define UDP_PUBLIC_BATCH_QUANTUM 16U
 #define UDP_FLOW_ID_MAX UINT32_C(0x00ffffff)
 #define UDP_MAX_PACKET 65535U
+#define UDP_PACKET_STRIDE 65536U
 #define UDP_GSO_SAFE_BYTES (60U * 1024U)
 #define UDP_GSO_MAX_SEGMENTS 64U
+
+/* Mirror the maximum number of GRO fragments retained in one GSO send item.
+ * A GRO receive must be staged if it needs multiple downstream slots. */
+static inline size_t udp_gso_segments_per_train(uint16_t segment_size) {
+    if (segment_size == 0U) return 0U;
+    size_t limit = VANE_MIN((size_t)UDP_GSO_MAX_SEGMENTS,
+                            UDP_GSO_SAFE_BYTES / (size_t)segment_size);
+    return limit != 0U ? limit : 1U;
+}
 #define UDP_PROBE_MAX_DATAGRAMS_HARD 64U
 #define UDP_PROBE_INITIAL_BYTES 4096U
 #define UDP_PROBE_CACHE_LIMIT 16U
@@ -147,6 +157,10 @@ struct udp_worker {
     unsigned char *rx_controls;
     uint8_t *rx_storage;
     size_t rx_count;
+
+    struct mmsghdr *up_rx_msgs;
+    struct iovec *up_rx_iov;
+    unsigned char *up_rx_controls;
 
     struct udp_down_item *down;
     struct mmsghdr *tx_msgs;

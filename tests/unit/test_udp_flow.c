@@ -522,5 +522,41 @@ int main(void) {
     test_reprobe_state_is_reversible();
     test_reprobe_send_error_releases_probe();
     test_quic_retry_identity_tracking();
+    /* Verify probe queue evicts buffered non-Initial when Initial needs space */
+    {
+        struct udp_worker worker = {0};
+        struct vane_runtime_config rt = {0};
+        rt.udp_probe_max_datagrams = 2U;
+        rt.udp_probe_max_bytes = 4096U;
+        struct vane_worker_args args = {0};
+        args.runtime = &rt;
+        worker.args = &args;
+        worker.pending_limit = 2U;
+        struct udp_probe probes[2] = {0};
+        uint32_t free_ids[2] = {1U, 0U};
+        worker.probes = probes;
+        worker.free_probe_ids = free_ids;
+        worker.free_probe_count = 2U;
+        struct udp_flow flow = {0};
+        flow.probe_id = UINT32_MAX;
+
+        uint8_t zero_rtt[20] = {
+            0xd0U, 0x00U, 0x00U, 0x00U, 0x01U, 4U, 1U, 2U, 3U, 4U, 4U, 5U, 6U, 7U, 8U,
+            0x44U, 0x00U, 0x01U, 0xaaU, 0xbbU
+        };
+        uint8_t initial[1200] = {
+            0xc0U, 0x00U, 0x00U, 0x00U, 0x01U, 4U, 1U, 2U, 3U, 4U, 4U, 5U, 6U, 7U, 8U
+        };
+        assert(udp_probe_append(&worker, &flow, zero_rtt, sizeof(zero_rtt), 0U, false));
+        assert(udp_probe_append(&worker, &flow, zero_rtt, sizeof(zero_rtt), 0U, false));
+        /* Queue is now full (2/2 non-Initials); another non-Initial is rejected */
+        assert(!udp_probe_append(&worker, &flow, zero_rtt, sizeof(zero_rtt), 0U, false));
+        /* An Initial evicts one non-Initial and succeeds */
+        assert(udp_probe_append(&worker, &flow, initial, sizeof(initial), 0U, false));
+        struct udp_probe *p = udp_probe_get(&worker, &flow);
+        assert(p != NULL && p->count == 2U);
+        assert(vane_quic_looks_like_initial(p->data + p->offsets[1], p->lengths[1]));
+        udp_probe_destroy(&worker, &flow);
+    }
     return 0;
 }

@@ -12,11 +12,19 @@ static bool parse_port(const char *text, bool allow_zero, uint16_t *out,
         vane_error_set(err, "missing port");
         return false;
     }
-    errno = 0;
-    char *end = NULL;
-    unsigned long value = strtoul(text, &end, 10);
-    if (errno != 0 || end == text || *end != '\0' || value > 65535UL ||
-        (!allow_zero && value == 0UL)) {
+    unsigned long value = 0UL;
+    for (const unsigned char *p = (const unsigned char *)text; *p != '\0'; p++) {
+        if (*p < '0' || *p > '9') {
+            vane_error_set(err, "invalid port: %s", text);
+            return false;
+        }
+        value = value * 10UL + (unsigned long)(*p - '0');
+        if (value > 65535UL) {
+            vane_error_set(err, "invalid port: %s", text);
+            return false;
+        }
+    }
+    if (!allow_zero && value == 0UL) {
         vane_error_set(err, "invalid port: %s", text);
         return false;
     }

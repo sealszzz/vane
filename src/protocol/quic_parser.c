@@ -361,9 +361,21 @@ static bool unprotect(const uint8_t *packet, size_t packet_len,
     bool ok = aes_gcm_decrypt(protection->key, nonce, aad, encrypted_offset,
                               packet + encrypted_offset, encrypted_len,
                               payload, payload_len);
+    OPENSSL_cleanse(aad, encrypted_offset);
     free(aad);
+    OPENSSL_cleanse(mask, sizeof(mask));
+    OPENSSL_cleanse(pn, sizeof(pn));
+    OPENSSL_cleanse(nonce, sizeof(nonce));
     if (!ok) {
         vane_error_set(err, "failed to decrypt QUIC Initial");
+        return false;
+    }
+    if ((first & 0x0cU) != 0U) {
+        OPENSSL_cleanse(*payload, *payload_len);
+        free(*payload);
+        *payload = NULL;
+        *payload_len = 0U;
+        vane_error_set(err, "invalid QUIC Initial reserved bits");
         return false;
     }
     *packet_number = pn_value;
@@ -425,15 +437,46 @@ static void protection_cache_cleanse(struct protection_cache *cache) {
     OPENSSL_cleanse(cache, sizeof(*cache));
 }
 
+static bool packet_matches_expected(const struct initial_packet *expected,
+                                    enum quic_version version,
+                                    const uint8_t *dcid, size_t dcid_len,
+                                    const uint8_t *scid, size_t scid_len,
+                                    const uint8_t *token, size_t token_len) {
+    if (expected->version != version ||
+        expected->dcid_len != dcid_len ||
+        expected->scid_len != scid_len ||
+        expected->token_len != token_len)
+        return false;
+    if (dcid_len != 0U && memcmp(expected->dcid, dcid, dcid_len) != 0)
+        return false;
+    if (scid_len != 0U && memcmp(expected->scid, scid, scid_len) != 0)
+        return false;
+    if (token_len != 0U && memcmp(expected->token, token, token_len) != 0)
+        return false;
+    return true;
+}
+
 static bool collect_datagram(const uint8_t *data, size_t len,
                              struct initial_packet **packets, size_t *count,
                              size_t *capacity, bool *have_largest,
                              uint64_t *largest,
                              struct protection_cache *key_cache,
                              const struct vane_datagram_view *key_dcid,
+                             const struct initial_packet *expected_ctx,
                              struct vane_error *err) {
     size_t pos = 0;
     bool ok = false;
+    bool local_have_largest = *have_largest;
+    uint64_t local_largest = *largest;
+    struct initial_packet first_ctx = {0};
+    bool have_first_ctx = false;
+    if (expected_ctx != NULL) {
+        first_ctx = *expected_ctx;
+        have_first_ctx = true;
+    } else if (*count > 0U) {
+        first_ctx = (*packets)[0];
+        have_first_ctx = true;
+    }
 
     while (pos < len) {
         pos += find_initial(data + pos, len - pos);
@@ -465,6 +508,14 @@ static bool collect_datagram(const uint8_t *data, size_t len,
             vane_error_set(err, "truncated QUIC protected payload");
             goto done;
         }
+        /* Reject context mismatches before deriving keys or decrypting to
+         * prevent coalesced multi-DCID CPU amplification. */
+        if (have_first_ctx &&
+            !packet_matches_expected(&first_ctx, version, dcid, dcid_len,
+                                     scid, scid_len, token, token_len)) {
+            vane_error_set(err, "QUIC Initial packet context changed during probe");
+            goto done;
+        }
         size_t packet_end = pos + protected_len;
         size_t pn_offset = pos - packet_start;
         if (!protection_cache_refresh(key_cache, version,
@@ -477,13 +528,17 @@ static bool collect_datagram(const uint8_t *data, size_t len,
             .scid = scid, .scid_len = scid_len,
             .token = token, .token_len = token_len,
         };
+        if (!have_first_ctx) {
+            first_ctx = packet;
+            have_first_ctx = true;
+        }
         uint64_t pn = 0;
         if (!unprotect(data + packet_start, packet_end - packet_start,
                        pn_offset, protected_len, &key_cache->keys,
-                       *have_largest, *largest,
+                       local_have_largest, local_largest,
                        &packet.payload, &packet.payload_len, &pn, err)) goto done;
-        if (!*have_largest || pn > *largest) *largest = pn;
-        *have_largest = true;
+        if (!local_have_largest || pn > local_largest) local_largest = pn;
+        local_have_largest = true;
         if (!append_packet(packets, count, capacity, packet, err)) {
             OPENSSL_cleanse(packet.payload, packet.payload_len);
             free(packet.payload);
@@ -491,6 +546,8 @@ static bool collect_datagram(const uint8_t *data, size_t len,
         }
         pos = packet_end;
     }
+    *have_largest = local_have_largest;
+    *largest = local_largest;
     ok = true;
 done:
     return ok;
@@ -549,9 +606,17 @@ static bool append_frame(struct crypto_frame **frames, size_t *count,
 static bool extract_frames(const uint8_t *payload, size_t len,
                            struct crypto_frame **frames, size_t *count,
                            size_t *capacity, struct vane_error *err) {
+    if (len == 0U) {
+        vane_error_set(err, "empty QUIC Initial payload");
+        return false;
+    }
     size_t pos = 0;
     while (pos < len) {
-        uint8_t type = payload[pos++];
+        size_t type = 0U;
+        if (!read_varint(payload, len, &pos, &type)) {
+            vane_error_set(err, "truncated QUIC frame type");
+            return false;
+        }
         if (type == 0x00U || type == 0x01U) continue;
         if (type == 0x02U || type == 0x03U) {
             if (!skip_ack(payload, len, &pos, type == 0x03U)) {
@@ -579,10 +644,10 @@ static bool extract_frames(const uint8_t *payload, size_t len,
             pos += data_len;
             continue;
         }
-        if (type == 0x1cU || type == 0x1dU) {
+        if (type == 0x1cU) {
             size_t ignored = 0, reason_len = 0;
             if (!read_varint(payload, len, &pos, &ignored) ||
-                (type == 0x1cU && !read_varint(payload, len, &pos, &ignored)) ||
+                !read_varint(payload, len, &pos, &ignored) ||
                 !read_varint(payload, len, &pos, &reason_len) || reason_len > len - pos) {
                 vane_error_set(err, "truncated QUIC CONNECTION_CLOSE frame");
                 return false;
@@ -590,7 +655,7 @@ static bool extract_frames(const uint8_t *payload, size_t len,
             pos += reason_len;
             continue;
         }
-        vane_error_set(err, "unsupported QUIC Initial frame type 0x%02x", type);
+        vane_error_set(err, "unsupported QUIC Initial frame type 0x%zx", type);
         return false;
     }
     return true;
@@ -610,7 +675,7 @@ bool vane_quic_is_initial_control(
     struct protection_cache keys = {0};
     bool matched = collect_datagram(data, len, &packets, &count, &capacity,
                                     &have_largest, &largest, &keys,
-                                    key_dcid, NULL) &&
+                                    key_dcid, NULL, NULL) &&
                    same_context(packets, count);
     protection_cache_cleanse(&keys);
     for (size_t i = 0U; matched && i < count; i++)
@@ -656,10 +721,14 @@ static enum vane_probe_result reassemble_and_parse(struct crypto_frame *frames,
     }
     if (stream_len == 0U) return VANE_PROBE_NEED_MORE;
     if (stream_len > *storage_cap) {
-        uint8_t *larger = realloc(*storage, stream_len);
+        uint8_t *larger = malloc(stream_len);
         if (larger == NULL) {
             vane_error_set(err, "out of memory");
             return VANE_PROBE_MALFORMED;
+        }
+        if (*storage != NULL) {
+            OPENSSL_cleanse(*storage, *storage_cap);
+            free(*storage);
         }
         *storage = larger;
         *storage_cap = stream_len;
@@ -807,6 +876,20 @@ static bool streaming_append_payload(struct vane_quic_probe_state *state,
     return true;
 }
 
+bool vane_quic_looks_like_zero_rtt(const uint8_t *data, size_t len) {
+    if (data == NULL || len < 8U || (data[0] & 0x80U) == 0U) return false;
+    enum quic_version version;
+    if (!parse_version(data + 1U, &version)) return false;
+    uint8_t type = (uint8_t)((data[0] & 0x30U) >> 4);
+    if (!((version == QUIC_V1 && type == 1U) ||
+          (version == QUIC_V2 && type == 2U)))
+        return false;
+    size_t dcid_len = data[5];
+    if (dcid_len > VANE_QUIC_MAX_CID_LEN || 6U + dcid_len >= len) return false;
+    size_t scid_len = data[6U + dcid_len];
+    return scid_len <= VANE_QUIC_MAX_CID_LEN && 7U + dcid_len + scid_len < len;
+}
+
 enum vane_probe_result
 vane_quic_probe_feed(struct vane_quic_probe_state *state,
                        const uint8_t *datagram, size_t datagram_len,
@@ -815,18 +898,32 @@ vane_quic_probe_feed(struct vane_quic_probe_state *state,
     if (state == NULL || datagram == NULL || hello == NULL)
         return VANE_PROBE_NOT_PROTOCOL;
     memset(hello, 0, sizeof(*hello));
-    if (!vane_quic_looks_like_initial(datagram, datagram_len))
-        return state->have_context ? VANE_PROBE_NEED_MORE
-                                   : VANE_PROBE_NOT_PROTOCOL;
+    if (!vane_quic_looks_like_initial(datagram, datagram_len)) {
+        if (state->have_context || vane_quic_looks_like_zero_rtt(datagram, datagram_len))
+            return VANE_PROBE_NEED_MORE;
+        return VANE_PROBE_NOT_PROTOCOL;
+    }
     if (!check_client_initial_size(datagram_len, err))
         return VANE_PROBE_MALFORMED;
 
+    struct initial_packet expected_ctx = {0};
+    const struct initial_packet *expected_ptr = NULL;
+    if (state->have_context) {
+        expected_ctx.version = state->version;
+        expected_ctx.dcid = state->dcid;
+        expected_ctx.dcid_len = state->dcid_len;
+        expected_ctx.scid = state->scid;
+        expected_ctx.scid_len = state->scid_len;
+        expected_ctx.token = state->token;
+        expected_ctx.token_len = state->token_len;
+        expected_ptr = &expected_ctx;
+    }
     struct initial_packet *fresh = NULL;
     size_t fresh_count = 0U, fresh_capacity = 0U;
     if (!collect_datagram(datagram, datagram_len,
                           &fresh, &fresh_count, &fresh_capacity,
                           &state->have_largest, &state->largest,
-                          &state->key_cache, NULL, err)) {
+                          &state->key_cache, NULL, expected_ptr, err)) {
         free_packets(fresh, fresh_count);
         return VANE_PROBE_MALFORMED;
     }
@@ -884,7 +981,7 @@ vane_quic_parse_client_hello(const struct vane_datagram_view *datagrams,
         if (!check_client_initial_size(datagrams[i].len, err) ||
             !collect_datagram(datagrams[i].data, datagrams[i].len,
                               &packets, &packet_count, &packet_capacity,
-                              &have_largest, &largest, &key_cache, NULL, err)) {
+                              &have_largest, &largest, &key_cache, NULL, NULL, err)) {
             protection_cache_cleanse(&key_cache);
             free_packets(packets, packet_count);
             return VANE_PROBE_MALFORMED;

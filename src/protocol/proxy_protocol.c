@@ -40,7 +40,15 @@ bool vane_proxy_v2_encode(const struct vane_addr *source,
     memset(out, 0, sizeof(*out));
     memcpy(out->bytes, signature, sizeof(signature));
     out->bytes[12] = 0x21; /* version 2, PROXY */
-    uint8_t proto = transport == VANE_PROXY_STREAM ? 0x01U : 0x02U;
+    uint8_t proto = 0U;
+    if (transport == VANE_PROXY_STREAM) {
+        proto = 0x01U;
+    } else if (transport == VANE_PROXY_DGRAM) {
+        proto = 0x02U;
+    } else {
+        vane_error_set(err, "invalid PROXY protocol transport");
+        return false;
+    }
     if (src.storage.ss_family == AF_INET) {
         out->bytes[13] = (uint8_t)(0x10U | proto);
         out->bytes[14] = 0;

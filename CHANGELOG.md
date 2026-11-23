@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.8
+
+### Release integrity fixes
+- Corrected GRO zero-copy receive staging for large segment sizes: the sender
+  and receiver now use one shared per-train capacity calculation, and a GRO
+  packet spanning multiple output slots is staged along with its successors
+  before the downstream queue can overwrite input buffers.
+- Allowed release-version headings in CHANGELOG.md while keeping VERSION as
+  the sole release-version source in application code and other release files.
+
+### UDP / QUIC Performance & Reliability
+- Rewrote upstream UDP receive hot path (`udp_receive_upstream`) to use zero-copy batched `recvmmsg()` directly into `down_storage` with connected-socket metadata (`IP_RECVTOS` / `IPV6_RECVTCLASS` + `UDP_GRO` without unused `IP_PKTINFO`) and level-triggered `EPOLLIN`, counting all consumed datagrams (including truncated ones) against `UDP_UPSTREAM_RECEIVE_QUANTUM` to preserve per-flow fairness while eliminating per-packet `recvmsg()`, per-packet `vane_monotonic_ms()`, and every-64-packet `epoll_ctl(EPOLL_CTL_MOD)` overhead.
+- Removed `EMSGSIZE` from `udp_gso_error_disables()` so a single low-MTU client falls back per datagram instead of permanently disabling GSO for the entire worker/flow (preserving 0.2.7 default PMTU discovery policy).
+- Aligned `rx_storage` / `down_storage` slot stride to `65536` bytes (`UDP_PACKET_STRIDE`), skipped zero-value `IP_TOS`/`IPV6_TCLASS` control messages, avoided redundant `memset(mmsg)` in `prepare_down_message()`, checked `flow->gso_enabled` before rebatching, checked `pending_limit` before capacity reclaim and removed side-effectful `O(N)` unconfirmed-flow eviction in `udp_flow_insert()` (keeping expiry-based reclamation and capacity rejection; non-Initial 5-tuple floods still consume `udp_flow_limit`), and fixed `udp_next_power_of_two()` high-bit overflow.
+- Added lightweight QUIC v1/v2 0-RTT ingress recognition (`vane_quic_looks_like_zero_rtt()`) when protocol rules are active so reordered 0-RTT packets arriving before Initial enter `PENDING` probe (within `pending_limit`, byte/slot, and timeout bounds) instead of falling back immediately, and prioritized QUIC Initial packets in `udp_probe_append()` by evicting buffered non-Initial datagrams when probe slots or bytes are full.
+
+### Protocol, TCP & Runtime Hardening
+- Validated QUIC Initial `(version, dcid, scid, token)` context in `collect_datagram()` before key derivation/AEAD decryption to block coalesced multi-DCID CPU amplification, read Initial frame types as RFC 9000 varints, rejected empty Initial payloads and forbidden `0x1d` frames, verified reserved bits post-AEAD, and cleansed remaining temporary key/AAD/stream buffers.
+- Rejected leading-dot and consecutive-dot SNI labels in `tls_parser.c` and started wildcard matching at index 1 in `route.c`; added null-pointer checks in `vane_tls_parse_records()`; validated `vane_proxy_transport` enum in `proxy_protocol.c`.
+- Ignored `SIGPIPE` at startup, removed hardcoded `mallopt(M_ARENA_MAX, 2)`, added `EAGAIN` retry and 108-byte abstract socket support in `notify_ready()`, guarded TCP `accept4()` and upstream `socket()` against `EMFILE`/`ENFILE`/unopened `idle_fd` spin via temporary listener pause with 200ms backoff, masked `EPOLLRDHUP` during TCP buffer backpressure, and hardened `parse_port()`, `config.c` SNI/target validation (rejecting `"*."` wildcard rules), `json_validate.c` capacity doubling, and `log.c`.
+
 ## Current release
 
 - Keep control-only QUIC Initials on the established upstream when a client

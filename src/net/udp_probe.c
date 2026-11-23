@@ -52,17 +52,47 @@ void udp_probe_destroy(struct udp_worker *worker, struct udp_flow *flow) {
     flow->probe_id = UINT32_MAX;
 }
 
+static bool probe_evict_one_non_initial(struct udp_probe *probe) {
+    for (size_t i = 0U; i < probe->count; i++) {
+        const uint8_t *pkt = probe->data + probe->offsets[i];
+        size_t pkt_len = probe->lengths[i];
+        if (vane_quic_looks_like_initial(pkt, pkt_len)) continue;
+        size_t off = probe->offsets[i];
+        size_t tail = probe->total_bytes - (off + pkt_len);
+        if (tail != 0U) {
+            memmove(probe->data + off, probe->data + off + pkt_len, tail);
+        }
+        OPENSSL_cleanse(probe->data + probe->total_bytes - pkt_len, pkt_len);
+        probe->total_bytes -= pkt_len;
+        for (size_t j = i + 1U; j < probe->count; j++) {
+            probe->offsets[j - 1U] = (uint32_t)(probe->offsets[j] - pkt_len);
+            probe->lengths[j - 1U] = probe->lengths[j];
+            probe->tclasses[j - 1U] = probe->tclasses[j];
+            probe->has_tclass[j - 1U] = probe->has_tclass[j];
+        }
+        probe->count--;
+        return true;
+    }
+    return false;
+}
+
 bool udp_probe_append(struct udp_worker *worker, struct udp_flow *flow,
                       const uint8_t *data, size_t len,
                       uint8_t tclass, bool has_tclass) {
     if (!probe_acquire(worker, flow)) return false;
     struct udp_probe *probe = udp_probe_get(worker, flow);
     if (probe == NULL) return false;
-    if (probe->count >= worker->args->runtime->udp_probe_max_datagrams ||
-        probe->count >= UDP_PROBE_MAX_DATAGRAMS_HARD ||
-        probe->total_bytes > worker->args->runtime->udp_probe_max_bytes ||
-        len > worker->args->runtime->udp_probe_max_bytes - probe->total_bytes)
-        return false;
+    size_t max_datagrams = VANE_MIN(
+        worker->args->runtime->udp_probe_max_datagrams,
+        (size_t)UDP_PROBE_MAX_DATAGRAMS_HARD);
+    size_t max_bytes = worker->args->runtime->udp_probe_max_bytes;
+    bool is_initial = vane_quic_looks_like_initial(data, len);
+    while (probe->count >= max_datagrams ||
+           probe->total_bytes > max_bytes ||
+           len > max_bytes - probe->total_bytes) {
+        if (!is_initial || !probe_evict_one_non_initial(probe))
+            return false;
+    }
     size_t required = probe->total_bytes + len;
     if (required > probe->capacity) {
         size_t new_capacity = probe->capacity == 0U

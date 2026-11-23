@@ -122,8 +122,9 @@ vane_route_select_tls(const struct vane_route_table *table,
      * linear scan over every configured wildcard. */
     size_t host_len = hello->server_name_len;
     if (host_len == 0U) host_len = strlen(hello->server_name);
-    for (size_t i = 0; i < host_len; i++) {
-        if (hello->server_name[i] != '.' || i + 1U >= host_len) continue;
+    for (size_t i = 1U; i < host_len; i++) {
+        if (hello->server_name[i] != '.' || hello->server_name[i - 1U] == '.' ||
+            i + 1U >= host_len) continue;
         target = find_hostname(table->wildcards, table->wildcard_count,
                                hello->server_name + i + 1U);
         if (target != NULL) return target;

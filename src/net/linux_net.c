@@ -96,6 +96,29 @@ int vane_udp_enable_metadata(int fd, int family, bool enable_gro,
     return enable_gro ? 1 : 0;
 }
 
+int vane_udp_enable_connected_metadata(int fd, int family, bool enable_gro,
+                                       struct vane_error *err) {
+    int one = 1;
+    if (family == AF_INET) {
+        if (!set_int_opt(fd, IPPROTO_IP, IP_RECVTOS, one, "IP_RECVTOS", err)) return -1;
+    } else if (family == AF_INET6) {
+        if (!set_int_opt(fd, IPPROTO_IPV6, IPV6_RECVTCLASS, one, "IPV6_RECVTCLASS", err) ||
+            !set_int_opt(fd, IPPROTO_IP, IP_RECVTOS, one, "IP_RECVTOS", err)) return -1;
+    } else {
+        vane_error_set(err, "unsupported UDP family");
+        return -1;
+    }
+    if (enable_gro && setsockopt(fd, SOL_UDP, UDP_GRO, &one, (socklen_t)sizeof(one)) != 0) {
+        if (errno != ENOPROTOOPT && errno != EOPNOTSUPP && errno != EINVAL) {
+            vane_error_set(err, "UDP_GRO: %s", strerror(errno));
+            return -1;
+        }
+        return 0;
+    }
+    return enable_gro ? 1 : 0;
+}
+
+
 static void set_local_ip(struct vane_addr *local, const void *addr, int family) {
     if (family == AF_INET) {
         uint16_t port = 0;
@@ -189,6 +212,58 @@ bool vane_udp_parse_meta(const struct msghdr *msg,
     return true;
 }
 
+void vane_udp_parse_connected_meta(const struct msghdr *msg,
+                                   struct vane_udp_meta *meta) {
+    meta->tclass = 0U;
+    meta->has_tclass = false;
+    meta->gro_segment_size = 0U;
+    meta->has_gro = false;
+    if (msg == NULL || msg->msg_controllen == 0U) return;
+    for (struct cmsghdr *cmsg = CMSG_FIRSTHDR((struct msghdr *)(uintptr_t)msg);
+         cmsg != NULL;
+         cmsg = CMSG_NXTHDR((struct msghdr *)(uintptr_t)msg, cmsg)) {
+        if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_TOS &&
+            cmsg->cmsg_len >= CMSG_LEN(0)) {
+            size_t data_len = cmsg->cmsg_len - CMSG_LEN(0);
+            int value = 0;
+            if (data_len >= sizeof(value)) {
+                memcpy(&value, CMSG_DATA(cmsg), sizeof(value));
+            } else if (data_len >= sizeof(uint8_t)) {
+                uint8_t byte = 0;
+                memcpy(&byte, CMSG_DATA(cmsg), sizeof(byte));
+                value = byte;
+            } else {
+                continue;
+            }
+            meta->tclass = (uint8_t)value;
+            meta->has_tclass = true;
+        } else if (cmsg->cmsg_level == IPPROTO_IPV6 &&
+                   cmsg->cmsg_type == IPV6_TCLASS &&
+                   cmsg->cmsg_len >= CMSG_LEN(sizeof(int))) {
+            int value = 0;
+            memcpy(&value, CMSG_DATA(cmsg), sizeof(value));
+            meta->tclass = (uint8_t)value;
+            meta->has_tclass = true;
+        } else if (cmsg->cmsg_level == SOL_UDP &&
+                   cmsg->cmsg_type == UDP_GRO &&
+                   cmsg->cmsg_len >= CMSG_LEN(0)) {
+            size_t data_len = cmsg->cmsg_len - CMSG_LEN(0);
+            int value = 0;
+            if (data_len >= sizeof(value)) {
+                memcpy(&value, CMSG_DATA(cmsg), sizeof(value));
+            } else if (data_len >= sizeof(uint16_t)) {
+                uint16_t value16 = 0;
+                memcpy(&value16, CMSG_DATA(cmsg), sizeof(value16));
+                value = value16;
+            }
+            if (value > 0 && value <= UINT16_MAX) {
+                meta->gro_segment_size = (uint16_t)value;
+                meta->has_gro = true;
+            }
+        }
+    }
+}
+
 ssize_t vane_udp_recvmsg(int fd, void *buf, size_t buf_len,
                            const struct vane_addr *bound,
                            struct vane_udp_meta *meta,
@@ -280,7 +355,7 @@ bool vane_udp_set_ancillary(struct msghdr *msg, size_t control_capacity,
         vane_error_set(err, "unsupported UDP send family");
         return false;
     }
-    if (tclass != NULL) {
+    if (tclass != NULL && *tclass != 0U) {
         int value = *tclass;
         int level = family == AF_INET ? IPPROTO_IP : IPPROTO_IPV6;
         int type = family == AF_INET ? IP_TOS : IPV6_TCLASS;

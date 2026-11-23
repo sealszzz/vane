@@ -107,9 +107,17 @@ static bool append_utf8(char **buf, size_t *len, size_t *cap, uint32_t cp,
     } else {
         return fail(sc, "unicode code point out of range");
     }
-    if (*len + n + 1 > *cap) {
-        size_t new_cap = *cap == 0 ? 32 : *cap * 2;
-        while (new_cap < *len + n + 1) new_cap *= 2;
+    if (*len > SIZE_MAX - n - 1U) return fail(sc, "string too large");
+    size_t needed = *len + n + 1U;
+    if (needed > *cap) {
+        size_t new_cap = *cap == 0U ? 32U : *cap;
+        while (new_cap < needed) {
+            if (new_cap > SIZE_MAX / 2U) {
+                new_cap = needed;
+                break;
+            }
+            new_cap *= 2U;
+        }
         char *new_buf = realloc(*buf, new_cap);
         if (new_buf == NULL) return fail(sc, "out of memory");
         *buf = new_buf;
@@ -249,7 +257,12 @@ static bool parse_object(struct scanner *sc) {
         char *key = NULL;
         if (!parse_string(sc, &key)) goto error;
         if (key_count == key_cap) {
-            size_t new_cap = key_cap == 0 ? 8 : key_cap * 2;
+            if (key_cap > SIZE_MAX / 2U / sizeof(*keys)) {
+                free(key);
+                (void)fail(sc, "too many object keys");
+                goto error;
+            }
+            size_t new_cap = key_cap == 0U ? 8U : key_cap * 2U;
             char **new_keys = realloc(keys, new_cap * sizeof(*new_keys));
             if (new_keys == NULL) {
                 free(key);
@@ -354,6 +367,10 @@ static bool parse_value(struct scanner *sc) {
 
 bool vane_json_validate_strict(const char *data, size_t len,
                                  struct vane_error *err) {
+    if (data == NULL && len != 0U) {
+        vane_error_set(err, "JSON input is NULL");
+        return false;
+    }
     struct scanner sc = {.s = data, .len = len, .pos = 0, .err = err};
     if (!parse_value(&sc)) return false;
     skip_ws(&sc);

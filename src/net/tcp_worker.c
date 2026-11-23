@@ -6,6 +6,7 @@
 #include "vane/tls_parser.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <netinet/tcp.h>
 #include <stdlib.h>
@@ -73,6 +74,10 @@ struct tcp_worker {
     const struct vane_worker_args *args;
     int epoll_fd;
     int listener_fd;
+    int idle_fd;
+    bool listener_paused;
+    uint64_t listener_resume_ms;
+    uint64_t last_accept_err_ms;
     struct tcp_connection *connections;
     uint32_t *free_ids;
     size_t free_count;
@@ -283,9 +288,8 @@ static bool update_interests(struct tcp_worker *worker, uint32_t id) {
     struct tcp_connection *c = &worker->connections[id];
     uint64_t ctok = event_token(TCP_EVENT_CLIENT, id, c->generation);
     uint32_t cevents = EPOLLET;
-    if (!c->client_eof) {
-        cevents |= EPOLLRDHUP;
-        if (c->c2u.len < c->c2u.max_cap) cevents |= EPOLLIN;
+    if (!c->client_eof && c->c2u.len < c->c2u.max_cap) {
+        cevents |= EPOLLIN | EPOLLRDHUP;
     }
     if (c->u2c.len != 0U) cevents |= EPOLLOUT;
     if (!epoll_mod_if_changed(worker->epoll_fd, c->client_fd, cevents, ctok,
@@ -301,9 +305,8 @@ static bool update_interests(struct tcp_worker *worker, uint32_t id) {
         if (c->state == CONN_CONNECTING) {
             uevents |= EPOLLOUT | EPOLLRDHUP;
         } else {
-            if (!c->upstream_eof) {
-                uevents |= EPOLLRDHUP;
-                if (c->u2c.len < c->u2c.max_cap) uevents |= EPOLLIN;
+            if (!c->upstream_eof && c->u2c.len < c->u2c.max_cap) {
+                uevents |= EPOLLIN | EPOLLRDHUP;
             }
             if (c->c2u.len != 0U) uevents |= EPOLLOUT;
         }
@@ -378,6 +381,8 @@ static bool configure_stream_socket(int fd,
     return true;
 }
 
+static void pause_listener(struct tcp_worker *worker, uint64_t now);
+
 static bool begin_connect(struct tcp_worker *worker, uint32_t id,
                           const struct vane_target_config *target) {
     struct tcp_connection *c = &worker->connections[id];
@@ -416,10 +421,13 @@ static bool begin_connect(struct tcp_worker *worker, uint32_t id,
     int family = target->location.storage.ss_family;
     int fd = socket(family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_TCP);
     if (fd < 0 || !configure_stream_socket(fd, worker->args->runtime)) {
+        int saved = errno;
         LOG_DEBUG("TCP worker %zu connection %u upstream socket failed: %s",
-                  worker->args->worker_index, id, strerror(errno));
+                  worker->args->worker_index, id, strerror(saved));
         if (fd >= 0) close(fd);
         close_connection(worker, id);
+        if (fd < 0 && (saved == EMFILE || saved == ENFILE))
+            pause_listener(worker, vane_monotonic_ms());
         return false;
     }
     c->upstream_fd = fd;
@@ -649,6 +657,20 @@ static bool allocate_connection(struct tcp_worker *worker, int client_fd,
     return true;
 }
 
+static void pause_listener(struct tcp_worker *worker, uint64_t now) {
+    if (worker->listener_paused) return;
+    if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_DEL,
+                  worker->listener_fd, NULL) == 0) {
+        worker->listener_paused = true;
+        worker->listener_resume_ms = now + 200U;
+        return;
+    }
+    if (now - worker->last_accept_err_ms >= 5000U) {
+        LOG_ERROR("TCP worker %zu failed to pause listener on FD exhaustion: %s",
+                  worker->args->worker_index, strerror(errno));
+    }
+}
+
 static void accept_clients(struct tcp_worker *worker) {
     size_t accepted = 0U;
     while (accepted < TCP_ACCEPT_QUANTUM) {
@@ -659,8 +681,24 @@ static void accept_clients(struct tcp_worker *worker) {
         if (fd < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;
-            LOG_WARN("TCP worker %zu accept4 failed: %s",
-                     worker->args->worker_index, strerror(errno));
+            int saved = errno;
+            uint64_t now = vane_monotonic_ms();
+            if (saved == EMFILE || saved == ENFILE) {
+                if (saved == EMFILE && worker->idle_fd >= 0) {
+                    close(worker->idle_fd);
+                    worker->idle_fd = -1;
+                    int drained = accept4(worker->listener_fd, NULL, NULL,
+                                          SOCK_NONBLOCK | SOCK_CLOEXEC);
+                    if (drained >= 0) close(drained);
+                    worker->idle_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+                }
+                pause_listener(worker, now);
+            }
+            if (now - worker->last_accept_err_ms >= 5000U) {
+                worker->last_accept_err_ms = now;
+                LOG_WARN("TCP worker %zu accept4 failed: %s",
+                         worker->args->worker_index, strerror(saved));
+            }
             return;
         }
         accepted++;
@@ -671,6 +709,7 @@ static void accept_clients(struct tcp_worker *worker) {
             continue;
         }
         (void)allocate_connection(worker, fd, &client);
+        if (worker->listener_paused) return;
     }
 }
 
@@ -701,6 +740,7 @@ void *vane_tcp_worker_main(void *opaque) {
     worker.args = args;
     worker.listener_fd = -1;
     worker.epoll_fd = -1;
+    worker.idle_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
     size_t capacity = args->tcp_connection_limit;
     if (capacity == 0U || capacity > 0x00ffffffU) goto done;
     worker.capacity = capacity;
@@ -770,6 +810,16 @@ void *vane_tcp_worker_main(void *opaque) {
             else if (kind == TCP_EVENT_UPSTREAM) handle_upstream_event(&worker, id, events[i].events);
         }
         uint64_t now = vane_monotonic_ms();
+        if (worker.listener_paused && now >= worker.listener_resume_ms) {
+            if (worker.idle_fd < 0)
+                worker.idle_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+            if (epoll_add(worker.epoll_fd, worker.listener_fd, EPOLLIN,
+                          event_token(TCP_EVENT_LISTENER, 0, 0))) {
+                worker.listener_paused = false;
+            } else {
+                worker.listener_resume_ms = now + 200U;
+            }
+        }
         if (now >= next_expiry_scan_ms) {
             expire_connections(&worker, now);
             next_expiry_scan_ms = now + TCP_EXPIRY_SCAN_INTERVAL_MS;
@@ -784,6 +834,7 @@ done:
     }
     if (worker.listener_fd >= 0) close(worker.listener_fd);
     if (worker.epoll_fd >= 0) close(worker.epoll_fd);
+    if (worker.idle_fd >= 0) close(worker.idle_fd);
     free(worker.connections);
     free(worker.free_ids);
     for (size_t i = 0; i < worker.buffer_cache.count; i++)

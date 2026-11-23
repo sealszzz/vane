@@ -46,6 +46,14 @@ static void append_probe_packet(struct udp_worker *worker, size_t id,
     struct udp_flow *flow = &worker->flows[id];
     if (!udp_probe_append(worker, flow, data, len, tclass, has_tclass)) {
         struct udp_probe *probe = udp_probe_get(worker, flow);
+        /* Do not destroy an in-progress QUIC Initial handshake when a burst
+         * of non-Initial (e.g. 0-RTT) datagrams fills the probe buffer. */
+        if (probe != NULL && probe->count > 0U &&
+            !vane_quic_looks_like_initial(data, len)) {
+            LOG_TRACE("UDP worker %zu flow=%zu dropped excess non-Initial probe packet bytes=%zu",
+                      worker->args->worker_index, id, len);
+            return;
+        }
         LOG_DEBUG("UDP worker %zu flow=%zu QUIC probe overflow datagrams=%zu "
                   "bytes=%zu incoming=%zu state=%s",
                   worker->args->worker_index, id,
@@ -92,6 +100,8 @@ static void process_segment(struct udp_worker *worker,
     bool has_protocol_rules = vane_route_has_protocol_rules(worker->args->routes);
     bool looks_initial = has_protocol_rules &&
                          vane_quic_looks_like_initial(data, len);
+    bool looks_zero_rtt = !looks_initial && has_protocol_rules &&
+                          vane_quic_looks_like_zero_rtt(data, len);
     struct vane_quic_initial_identity incoming;
     if (looks_initial &&
         !vane_quic_read_initial_identity(data, len, &incoming)) {
@@ -144,7 +154,7 @@ static void process_segment(struct udp_worker *worker,
         }
     }
 
-    bool needs_probe = looks_initial;
+    bool needs_probe = looks_initial || looks_zero_rtt;
     size_t new_id = 0;
     struct udp_flow *flow = udp_flow_insert(worker, key, needs_probe, &new_id);
     if (flow == NULL) {
@@ -196,8 +206,9 @@ static size_t try_rebatch_public(struct udp_worker *worker, int first, int total
     if (first + 1 == total || segment_size == 0U || first_meta->has_gro)
         return 0U;
     struct udp_flow *flow = &worker->flows[id];
+    if (!flow->gso_enabled) return 0U;
     const uint8_t *first_packet =
-        worker->rx_storage + (size_t)first * UDP_MAX_PACKET;
+        worker->rx_storage + (size_t)first * UDP_PACKET_STRIDE;
 
     size_t header_len = flow->target->proxy_protocol
         ? (vane_addr_effective_family(&flow->key.client) == AF_INET ? 28U : 52U)
@@ -227,7 +238,7 @@ static size_t try_rebatch_public(struct udp_worker *worker, int first, int total
         /* The identical key still names this flow: this worker owns the
          * table and collecting views does not mutate it. Avoid rehashing. */
         const uint8_t *packet =
-            worker->rx_storage + (size_t)j * UDP_MAX_PACKET;
+            worker->rx_storage + (size_t)j * UDP_PACKET_STRIDE;
         if (active_packet_requires_segment_path(worker, flow, packet,
                                                 segment_size))
             break;
@@ -269,7 +280,7 @@ static bool aggregate_requires_segment_path(
 
 static size_t process_public_message(struct udp_worker *worker, int index,
                                       int total, const struct vane_udp_meta *meta) {
-    const uint8_t *data = worker->rx_storage + (size_t)index * UDP_MAX_PACKET;
+    const uint8_t *data = worker->rx_storage + (size_t)index * UDP_PACKET_STRIDE;
     size_t len = worker->rx_msgs[index].msg_len;
     struct udp_flow_key key = {.client = meta->peer, .local = meta->local};
     size_t id = udp_flow_lookup_id(worker, &key);
@@ -385,78 +396,107 @@ static void note_upstream_quic_identity(struct udp_flow *flow,
     }
 }
 
-static void rearm_upstream(struct udp_worker *worker, size_t id) {
-    struct udp_flow *flow = &worker->flows[id];
-    struct epoll_event event = {
-        .events = EPOLLIN | EPOLLET,
-        .data.u64 = udp_event_token(UDP_EVENT_UPSTREAM,
-            (uint32_t)id, flow->generation),
-    };
-    if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD,
-                  flow->upstream_fd, &event) != 0) {
-        int saved = errno;
-        LOG_WARN("UDP worker %zu flow=%zu upstream rearm failed: %s",
-                 worker->args->worker_index, id, strerror(saved));
-        udp_flow_remove(worker, id);
-    }
-}
-
 void udp_receive_upstream(struct udp_worker *worker, size_t id) {
     struct udp_flow *flow = &worker->flows[id];
     if (flow->state == UDP_FLOW_QUIESCENT && !udp_flow_resume(worker, id))
         return;
     size_t recoverable_errors = 0U;
-    size_t received = 0U, received_bytes = 0U;
-    while (received < UDP_UPSTREAM_RECEIVE_QUANTUM &&
+    size_t inspected = 0U, received_bytes = 0U;
+    while (inspected < UDP_UPSTREAM_RECEIVE_QUANTUM &&
            received_bytes < UDP_UPSTREAM_RECEIVE_BYTES) {
-        uint8_t *buffer = worker->down_storage + worker->down_count * UDP_MAX_PACKET;
-        struct vane_udp_meta meta;
-        ssize_t n = vane_udp_recvmsg(flow->upstream_fd, buffer,
-                                       UDP_MAX_PACKET,
-                                       &flow->upstream_local, &meta, NULL);
-        if (n < 0) {
+        if (worker->down_count >= worker->down_capacity)
+            udp_downstream_flush(worker);
+        if (worker->down_count >= worker->down_capacity) return;
+        size_t base = worker->down_count;
+        size_t avail = worker->down_capacity - base;
+        size_t batch_cap = VANE_MIN(worker->rx_count,
+            VANE_MIN(avail, UDP_UPSTREAM_RECEIVE_QUANTUM - inspected));
+        for (size_t k = 0U; k < batch_cap; k++) {
+            struct mmsghdr *mmsg = &worker->up_rx_msgs[k];
+            worker->up_rx_iov[k].iov_base =
+                worker->down_storage + (base + k) * UDP_PACKET_STRIDE;
+            worker->up_rx_iov[k].iov_len = UDP_MAX_PACKET;
+            mmsg->msg_len = 0U;
+            mmsg->msg_hdr.msg_controllen = VANE_UDP_CONTROL_SIZE;
+            mmsg->msg_hdr.msg_flags = 0;
+        }
+        int got = recvmmsg(flow->upstream_fd, worker->up_rx_msgs,
+                           (unsigned int)batch_cap,
+                           MSG_DONTWAIT | MSG_TRUNC, NULL);
+        if (got < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;
             int saved = errno;
             if (saved != ENOBUFS &&
                 !udp_flow_handle_io_error(worker, id, "upstream receive", saved))
                 return;
-            /* A consumed asynchronous error can coexist with queued payload.
-             * Preserve ET readiness until EAGAIN; rearm if errors exhaust the
-             * bounded retry budget so no queued response needs a new packet. */
-            if (++recoverable_errors >= UDP_RECEIVE_ERROR_QUANTUM) {
-                rearm_upstream(worker, id);
+            if (++recoverable_errors >= UDP_RECEIVE_ERROR_QUANTUM)
                 return;
-            }
             continue;
         }
-        received++;
-        received_bytes += (size_t)n;
-        udp_flow_clear_error_history(flow);
-        flow->last_activity_ms = vane_monotonic_ms();
-        bool first_response = !flow->upstream_confirmed;
-        flow->upstream_confirmed = true;
-        uint16_t segment = meta.has_gro ? meta.gro_segment_size : 0;
-        note_upstream_quic_identity(flow, buffer, (size_t)n, segment);
-        if (first_response) {
-            char client_buf[96];
-            LOG_DEBUG("UDP worker %zu flow=%zu first upstream response client=%s "
-                      "bytes=%zd gro=%s segment=%u",
-                      worker->args->worker_index, id,
-                      vane_addr_format(&flow->key.client, client_buf, sizeof(client_buf)),
-                      n, meta.has_gro ? "on" : "off", (unsigned)segment);
-        } else {
-            LOG_TRACE("UDP worker %zu flow=%zu upstream response bytes=%zd gro=%s segment=%u",
-                      worker->args->worker_index, id, n,
-                      meta.has_gro ? "on" : "off", (unsigned)segment);
+        if (got == 0) return;
+
+        uint64_t now = vane_monotonic_ms();
+        bool spilled = false;
+        for (int k = 0; k < got; k++) {
+            inspected++;
+            struct mmsghdr *mmsg = &worker->up_rx_msgs[k];
+            size_t n = mmsg->msg_len;
+            if ((mmsg->msg_hdr.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) != 0 ||
+                n > UDP_MAX_PACKET) {
+                if (!udp_flow_handle_io_error(worker, id, "upstream receive",
+                                              EMSGSIZE))
+                    return;
+                continue;
+            }
+            uint8_t *buffer = spilled
+                ? (worker->rx_storage + (size_t)k * UDP_PACKET_STRIDE)
+                : (worker->down_storage + (base + (size_t)k) * UDP_PACKET_STRIDE);
+            struct vane_udp_meta meta;
+            vane_udp_parse_connected_meta(&mmsg->msg_hdr, &meta);
+            received_bytes += n;
+            udp_flow_clear_error_history(flow);
+            flow->last_activity_ms = now;
+            bool first_response = !flow->upstream_confirmed;
+            flow->upstream_confirmed = true;
+            uint16_t segment = meta.has_gro ? meta.gro_segment_size : 0;
+            note_upstream_quic_identity(flow, buffer, n, segment);
+            if (first_response) {
+                char client_buf[96];
+                LOG_DEBUG("UDP worker %zu flow=%zu first upstream response client=%s "
+                          "bytes=%zu gro=%s segment=%u",
+                          worker->args->worker_index, id,
+                          vane_addr_format(&flow->key.client, client_buf, sizeof(client_buf)),
+                          n, meta.has_gro ? "on" : "off", (unsigned)segment);
+            } else {
+                LOG_TRACE("UDP worker %zu flow=%zu upstream response bytes=%zu gro=%s segment=%u",
+                          worker->args->worker_index, id, n,
+                          meta.has_gro ? "on" : "off", (unsigned)segment);
+            }
+            /* Most receives fit one downstream slot and stay zero-copy.
+             * A GRO train requiring multiple output slots must be staged
+             * before queueing: its source can otherwise be overwritten when
+             * the queue flushes/reuses down_storage, even with no later
+             * recvmmsg result. Also stage later results before a split train
+             * overwrites their pre-filled output slots. */
+            if (!spilled && segment != 0U && n > (size_t)segment &&
+                n > udp_gso_segments_per_train(segment) * (size_t)segment) {
+                for (int j = k; j < got; j++) {
+                    size_t jlen = worker->up_rx_msgs[j].msg_len;
+                    if (jlen != 0U && jlen <= UDP_MAX_PACKET) {
+                        memcpy(worker->rx_storage + (size_t)j * UDP_PACKET_STRIDE,
+                               worker->down_storage + (base + (size_t)j) * UDP_PACKET_STRIDE,
+                               jlen);
+                    }
+                }
+                spilled = true;
+                buffer = worker->rx_storage + (size_t)k * UDP_PACKET_STRIDE;
+            }
+            udp_downstream_queue(worker, flow, buffer, n, segment,
+                                 meta.tclass, meta.has_tclass);
+            if (worker->down_count == worker->down_capacity)
+                udp_downstream_flush(worker);
         }
-        udp_downstream_queue(worker, flow, buffer, (size_t)n, segment,
-                             meta.tclass, meta.has_tclass);
-        if (worker->down_count == worker->down_capacity) udp_downstream_flush(worker);
+        if ((size_t)got < batch_cap) return;
     }
-    /* A busy upstream must yield even when it never reaches EAGAIN. MOD
-     * schedules another turn for already queued payload, without requiring
-     * any later packet to create an edge. Flush before servicing other flows. */
-    udp_downstream_flush(worker);
-    rearm_upstream(worker, id);
 }

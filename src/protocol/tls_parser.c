@@ -48,12 +48,21 @@ static bool hostname_copy_lower(const uint8_t *src, size_t len,
             vane_error_set(err, "TLS SNI hostname is not printable ASCII");
             return false;
         }
-        hello->server_name[i] = (char)tolower(c);
+        hello->server_name[i] = (c >= 'A' && c <= 'Z')
+                                    ? (char)(c + ('a' - 'A'))
+                                    : (char)c;
     }
-    while (len > 0 && hello->server_name[len - 1] == '.') len--;
-    if (len == 0) {
-        vane_error_set(err, "TLS SNI hostname is empty");
+    if (len > 0U && hello->server_name[len - 1U] == '.') len--;
+    if (len == 0U || hello->server_name[0] == '.' ||
+        hello->server_name[len - 1U] == '.') {
+        vane_error_set(err, "TLS SNI hostname has empty label");
         return false;
+    }
+    for (size_t i = 1U; i < len; i++) {
+        if (hello->server_name[i] == '.' && hello->server_name[i - 1U] == '.') {
+            vane_error_set(err, "TLS SNI hostname has consecutive dots");
+            return false;
+        }
     }
     hello->server_name[len] = '\0';
     hello->server_name_len = len;
@@ -189,7 +198,10 @@ static enum vane_probe_result parse_single_record(const uint8_t *data, size_t le
     if (!need(len, TLS_HEADER_LEN, payload_len)) return VANE_PROBE_NEED_MORE;
     if (payload_len < 4U) return VANE_PROBE_NEED_MORE;
     const uint8_t *payload = data + TLS_HEADER_LEN;
-    if (payload[0] != TLS_HANDSHAKE_CLIENT_HELLO) return VANE_PROBE_MALFORMED;
+    if (payload[0] != TLS_HANDSHAKE_CLIENT_HELLO) {
+        vane_error_set(err, "TLS handshake is not ClientHello");
+        return VANE_PROBE_MALFORMED;
+    }
     size_t handshake_len = (size_t)payload[1] << 16 | (size_t)payload[2] << 8 | payload[3];
     if (handshake_len > VANE_TLS_HANDSHAKE_MAX_SIZE - 4U) {
         vane_error_set(err, "TLS ClientHello exceeds probe limit");
@@ -203,6 +215,7 @@ enum vane_probe_result
 vane_tls_parse_records(const uint8_t *data, size_t len,
                          struct vane_client_hello *hello,
                          struct vane_error *err) {
+    if (data == NULL || hello == NULL) return VANE_PROBE_MALFORMED;
     enum vane_probe_result fast = parse_single_record(data, len, hello, err);
     if (fast == VANE_PROBE_MATCHED || fast == VANE_PROBE_NOT_PROTOCOL ||
         fast == VANE_PROBE_MALFORMED) return fast;

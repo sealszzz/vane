@@ -133,7 +133,7 @@ static void test_upstream_fallback(struct udp_flow *flow, bool proxy) {
 
 int main(void) {
     assert(udp_gso_error_disables(EINVAL));
-    assert(udp_gso_error_disables(EMSGSIZE));
+    assert(!udp_gso_error_disables(EMSGSIZE));
     assert(udp_gso_error_disables(ENOPROTOOPT));
     assert(!udp_gso_error_disables(ENOBUFS));
     assert(!udp_gso_error_disables(EAGAIN));

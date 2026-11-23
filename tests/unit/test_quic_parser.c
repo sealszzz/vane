@@ -181,9 +181,36 @@ static void test_overlap_and_fragmentation(void) {
     for (size_t i = 0U; i < 8U; i++) free(packets[i]);
 }
 
+static void test_zero_rtt_ingress_predicate(void) {
+    /* Valid QUIC v1 0-RTT (type=1 -> 0xd0), DCID len=4, SCID len=4, + payload */
+    const uint8_t v1_0rtt[20] = {
+        0xd0U, 0x00U, 0x00U, 0x00U, 0x01U, 4U, 1U, 2U, 3U, 4U, 4U, 5U, 6U, 7U, 8U,
+        0x44U, 0x00U, 0x01U, 0xaaU, 0xbbU
+    };
+    assert(vane_quic_looks_like_zero_rtt(v1_0rtt, sizeof(v1_0rtt)));
+    /* Valid QUIC v2 0-RTT (type=2 -> 0xe0) */
+    const uint8_t v2_0rtt[20] = {
+        0xe0U, 0x6bU, 0x33U, 0x43U, 0xcfU, 4U, 1U, 2U, 3U, 4U, 4U, 5U, 6U, 7U, 8U,
+        0x44U, 0x00U, 0x01U, 0xaaU, 0xbbU
+    };
+    assert(vane_quic_looks_like_zero_rtt(v2_0rtt, sizeof(v2_0rtt)));
+    /* QUIC v1 Initial (type=0 -> 0xc0) is not 0-RTT */
+    uint8_t v1_init[20];
+    memcpy(v1_init, v1_0rtt, sizeof(v1_init));
+    v1_init[0] = 0xc0U;
+    assert(!vane_quic_looks_like_zero_rtt(v1_init, sizeof(v1_init)));
+    /* Invalid DCID length (> 20) rejected */
+    uint8_t bad_cid[32] = {0xd0U, 0x00U, 0x00U, 0x00U, 0x01U, 21U};
+    assert(!vane_quic_looks_like_zero_rtt(bad_cid, sizeof(bad_cid)));
+    /* Truncated packet without payload rejected */
+    assert(!vane_quic_looks_like_zero_rtt(v1_0rtt, 15U));
+    assert(!vane_quic_looks_like_zero_rtt(NULL, 20U));
+}
+
 int main(void) {
     test_random_and_truncated();
     test_real_nextquic_initial();
     test_overlap_and_fragmentation();
+    test_zero_rtt_ingress_predicate();
     return 0;
 }

@@ -3,6 +3,7 @@
 #include "vane/runtime.h"
 #include "vane/version.h"
 
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -40,13 +41,17 @@ static void usage(const char *program) {
 }
 
 int main(int argc, char **argv) {
+    (void)signal(SIGPIPE, SIG_IGN);
+    const char *program = (argc > 0 && argv != NULL && argv[0] != NULL)
+                              ? argv[0]
+                              : "vane";
     if (argc == 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)) {
         vane_version_print();
         return 0;
     }
     bool check_only = argc == 3 && strcmp(argv[1], "--check") == 0;
     if ((!check_only && argc != 2) || (check_only && argc != 3)) {
-        usage(argv[0]);
+        usage(program);
         return 2;
     }
     const char *config_path = check_only ? argv[2] : argv[1];

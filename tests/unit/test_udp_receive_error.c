@@ -1,24 +1,53 @@
 #include "udp_internal.h"
 
 #include <assert.h>
+#include <linux/udp.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <unistd.h>
 
-ssize_t __real_recvmsg(int fd, struct msghdr *message, int flags);
-ssize_t __wrap_recvmsg(int fd, struct msghdr *message, int flags);
+int __real_recvmmsg(int fd, struct mmsghdr *msgvec, unsigned int vlen,
+                    int flags, struct timespec *timeout);
+int __wrap_recvmmsg(int fd, struct mmsghdr *msgvec, unsigned int vlen,
+                    int flags, struct timespec *timeout);
 static size_t transient_errors;
 static size_t received_payloads;
+static bool inject_gro_pair;
+static uint16_t inject_segment_size;
 
-ssize_t __wrap_recvmsg(int fd, struct msghdr *message, int flags) {
+
+int __wrap_recvmmsg(int fd, struct mmsghdr *msgvec, unsigned int vlen,
+                    int flags, struct timespec *timeout) {
+    if (inject_gro_pair) {
+        /* Two results from one recvmmsg turn: the first GRO record spans
+         * multiple downstream items, the second must survive unchanged. */
+        assert(vlen >= 2U);
+        inject_gro_pair = false;
+        memset(msgvec[0].msg_hdr.msg_iov[0].iov_base, 'A', 60000U);
+        memset(msgvec[1].msg_hdr.msg_iov[0].iov_base, 'B', 37U);
+        msgvec[0].msg_len = 60000U;
+        msgvec[1].msg_len = 37U;
+        msgvec[0].msg_hdr.msg_flags = 0;
+        msgvec[1].msg_hdr.msg_flags = 0;
+        struct cmsghdr *gro = CMSG_FIRSTHDR(&msgvec[0].msg_hdr);
+        assert(gro != NULL);
+        gro->cmsg_level = IPPROTO_UDP;
+        gro->cmsg_type = UDP_GRO;
+        gro->cmsg_len = CMSG_LEN(sizeof(uint16_t));
+        memcpy(CMSG_DATA(gro), &inject_segment_size, sizeof(inject_segment_size));
+        msgvec[0].msg_hdr.msg_controllen = CMSG_SPACE(sizeof(uint16_t));
+        msgvec[1].msg_hdr.msg_controllen = 0U;
+        received_payloads += 2U;
+        return 2;
+    }
     if (transient_errors != 0U) {
         transient_errors--;
         errno = ENOBUFS;
         return -1;
     }
-    ssize_t n = __real_recvmsg(fd, message, flags);
-    if (n >= 0) received_payloads++;
+    int n = __real_recvmmsg(fd, msgvec, vlen, flags, timeout);
+    if (n > 0) received_payloads += (size_t)n;
     return n;
 }
 
@@ -48,7 +77,7 @@ int main(void) {
     flow.key.client = flow.upstream_local;
     flow.key.local = target.location;
     int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
-    struct epoll_event event = {.events = EPOLLIN | EPOLLET};
+    struct epoll_event event = {.events = EPOLLIN};
     assert(epoll_fd >= 0);
     assert(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client, &event) == 0);
     assert(sendto(backend, "response", 8U, 0,
@@ -60,11 +89,25 @@ int main(void) {
     struct vane_worker_args args = {0};
     struct udp_worker worker = {
         .args = &args, .flows = &flow, .flow_capacity = 1U,
-        .epoll_fd = epoll_fd, .down_capacity = 3U,
+        .epoll_fd = epoll_fd, .rx_count = 16U, .down_capacity = 3U,
     };
-    worker.down_storage = malloc(3U * UDP_MAX_PACKET);
+    worker.rx_storage = malloc(worker.rx_count * UDP_PACKET_STRIDE);
+    worker.up_rx_msgs = calloc(worker.rx_count, sizeof(*worker.up_rx_msgs));
+    worker.up_rx_iov = calloc(worker.rx_count, sizeof(*worker.up_rx_iov));
+    worker.up_rx_controls = calloc(worker.rx_count, VANE_UDP_CONTROL_SIZE);
+    worker.down_storage = malloc(3U * UDP_PACKET_STRIDE);
     worker.down = calloc(3U, sizeof(*worker.down));
-    assert(worker.down_storage && worker.down);
+    assert(worker.rx_storage && worker.up_rx_msgs && worker.up_rx_iov &&
+           worker.up_rx_controls && worker.down_storage && worker.down);
+    for (size_t i = 0U; i < worker.rx_count; i++) {
+        worker.up_rx_iov[i].iov_base = worker.rx_storage + i * UDP_PACKET_STRIDE;
+        worker.up_rx_iov[i].iov_len = UDP_MAX_PACKET;
+        worker.up_rx_msgs[i].msg_hdr.msg_iov = &worker.up_rx_iov[i];
+        worker.up_rx_msgs[i].msg_hdr.msg_iovlen = 1;
+        worker.up_rx_msgs[i].msg_hdr.msg_control =
+            worker.up_rx_controls + i * VANE_UDP_CONTROL_SIZE;
+        worker.up_rx_msgs[i].msg_hdr.msg_controllen = VANE_UDP_CONTROL_SIZE;
+    }
     udp_receive_upstream(&worker, 0U);
     udp_flow_handle_epoll_error(&worker, 0U, event.events);
     assert(flow.state == UDP_FLOW_ACTIVE);
@@ -126,6 +169,25 @@ int main(void) {
         delivered++;
     }
     assert(delivered == UDP_UPSTREAM_RECEIVE_QUANTUM + 5U);
+    /* Regression: a 60KB GRO record with 32768B / 40000B segments
+     * and a following 37B record in the SAME recvmmsg batch. No output
+     * slot may overwrite either the subsequent record or the GRO source. */
+    for (size_t mode = 0U; mode < 2U; mode++) {
+        inject_segment_size = mode == 0U ? 32768U : 40000U;
+        inject_gro_pair = true;
+        udp_receive_upstream(&worker, 0U);
+        assert(!inject_gro_pair);
+        unsigned char buffer[45000];
+        ssize_t got = recv(sink, buffer, sizeof(buffer), MSG_DONTWAIT);
+        assert(got == (ssize_t)inject_segment_size);
+        for (ssize_t i = 0; i < got; i++) assert(buffer[i] == 'A');
+        got = recv(sink, buffer, sizeof(buffer), MSG_DONTWAIT);
+        assert(got == (ssize_t)(60000U - inject_segment_size));
+        for (ssize_t i = 0; i < got; i++) assert(buffer[i] == 'A');
+        got = recv(sink, buffer, sizeof(buffer), MSG_DONTWAIT);
+        assert(got == 37);
+        for (ssize_t i = 0; i < got; i++) assert(buffer[i] == 'B');
+    }
     close(sink);
     close(worker.public_fd);
     free(worker.tx_msgs);
@@ -134,6 +196,10 @@ int main(void) {
     close(backend);
     close(client);
     close(epoll_fd);
+    free(worker.rx_storage);
+    free(worker.up_rx_msgs);
+    free(worker.up_rx_iov);
+    free(worker.up_rx_controls);
     free(worker.down_storage);
     free(worker.down);
     return 0;

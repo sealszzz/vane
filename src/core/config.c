@@ -169,7 +169,9 @@ static char *lower_trim_hostname(const char *raw) {
     while (*raw != '\0' && isspace((unsigned char)*raw)) raw++;
     size_t len = strlen(raw);
     while (len > 0 && isspace((unsigned char)raw[len - 1])) len--;
-    while (len > 0 && raw[len - 1] == '.') len--;
+    if (len > 1U && raw[len - 1U] == '.' && raw[len - 2U] != '.' &&
+        !(len == 2U && raw[0] == '*'))
+        len--;
     char *s = malloc(len + 1U);
     if (s == NULL) return NULL;
     for (size_t i = 0; i < len; i++) s[i] = (char)tolower((unsigned char)raw[i]);

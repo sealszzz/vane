@@ -41,6 +41,7 @@ vane_quic_parse_client_hello(const struct vane_datagram_view *datagrams,
                                struct vane_error *err);
 
 bool vane_quic_looks_like_initial(const uint8_t *data, size_t len);
+bool vane_quic_looks_like_zero_rtt(const uint8_t *data, size_t len);
 bool vane_quic_looks_like_retry(const uint8_t *data, size_t len);
 bool vane_quic_read_long_header_identity(
     const uint8_t *data, size_t len,

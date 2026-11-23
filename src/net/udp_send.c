@@ -12,7 +12,7 @@
 
 bool udp_gso_error_disables(int error_number) {
     return error_number == EIO || error_number == EINVAL ||
-           error_number == EMSGSIZE || error_number == ENOPROTOOPT ||
+           error_number == ENOPROTOOPT ||
            error_number == EOPNOTSUPP || error_number == ENOSYS;
 }
 
@@ -22,14 +22,16 @@ static bool prepare_down_message(struct udp_worker *worker, size_t index,
     struct mmsghdr *mmsg = &worker->tx_msgs[index];
     struct iovec *iov = &worker->tx_iov[index];
     unsigned char *control = worker->tx_controls + index * VANE_UDP_CONTROL_SIZE;
-    memset(mmsg, 0, sizeof(*mmsg));
     iov->iov_base = item->data + offset;
     iov->iov_len = len;
+    mmsg->msg_len = 0U;
     mmsg->msg_hdr.msg_name = (void *)(uintptr_t)&item->peer.storage;
     mmsg->msg_hdr.msg_namelen = item->peer.len;
     mmsg->msg_hdr.msg_iov = iov;
     mmsg->msg_hdr.msg_iovlen = 1;
     mmsg->msg_hdr.msg_control = control;
+    mmsg->msg_hdr.msg_controllen = 0U;
+    mmsg->msg_hdr.msg_flags = 0;
     const uint8_t *tclass = item->has_tclass ? &item->tclass : NULL;
     const uint16_t *segment = use_gso ? &item->segment_size : NULL;
     return vane_udp_set_ancillary(&mmsg->msg_hdr, VANE_UDP_CONTROL_SIZE,
@@ -47,6 +49,7 @@ void udp_downstream_flush(struct udp_worker *worker) {
     size_t limit = VANE_MIN(worker->down_capacity, VANE_ARRAY_LEN(next_item));
     if (limit == 0U) { worker->down_count = 0U; return; }
     size_t item_index = 0U, item_offset = 0U;
+    bool force_unsegmented_first = false;
     while (item_index < worker->down_count) {
         size_t scan_index = item_index, scan_offset = item_offset;
         size_t prepared = 0U;
@@ -55,7 +58,8 @@ void udp_downstream_flush(struct udp_worker *worker) {
             const struct udp_down_item *item = &worker->down[scan_index];
             bool segmented = item->has_segment && item->segment_size != 0U &&
                              item->len > item->segment_size;
-            bool use_gso = segmented && worker->public_gso_enabled;
+            bool use_gso = segmented && worker->public_gso_enabled &&
+                           !(force_unsegmented_first && scan_index == item_index);
             size_t len = item->len - scan_offset;
             if (segmented && !use_gso)
                 len = VANE_MIN(len, (size_t)item->segment_size);
@@ -86,6 +90,7 @@ void udp_downstream_flush(struct udp_worker *worker) {
         } while (sent < 0 && errno == EINTR);
         if (sent > 0) {
             size_t last = (size_t)sent - 1U;
+            if (next_item[last] != item_index) force_unsegmented_first = false;
             item_index = next_item[last];
             item_offset = next_offset[last];
             /* A partial return does not preserve the failed message's errno.
@@ -98,6 +103,10 @@ void udp_downstream_flush(struct udp_worker *worker) {
                       worker->args->worker_index, prepared, strerror(saved));
             break;
         }
+        if (first_gso && saved == EMSGSIZE) {
+            force_unsegmented_first = true;
+            continue;
+        }
         if (first_gso && udp_gso_error_disables(saved)) {
             LOG_WARN("UDP worker %zu public UDP_SEGMENT disabled: %s",
                      worker->args->worker_index, strerror(saved));
@@ -106,6 +115,7 @@ void udp_downstream_flush(struct udp_worker *worker) {
         }
         LOG_WARN("UDP worker %zu downstream send failed: %s (datagram dropped)",
                  worker->args->worker_index, strerror(saved));
+        if (next_item[0] != item_index) force_unsegmented_first = false;
         item_index = next_item[0];
         item_offset = next_offset[0];
     }
@@ -120,7 +130,7 @@ static bool queue_down_train(struct udp_worker *worker, const struct udp_flow *f
     if (worker->down_count == worker->down_capacity) udp_downstream_flush(worker);
     if (worker->down_count == worker->down_capacity) return false;
     struct udp_down_item *item = &worker->down[worker->down_count];
-    item->data = worker->down_storage + worker->down_count * UDP_MAX_PACKET;
+    item->data = worker->down_storage + worker->down_count * UDP_PACKET_STRIDE;
     /* Normal receives already occupy this slot. A split GRO train can
      * wrap the queue and move a suffix down inside its original slot. */
     if (item->data != data) memmove(item->data, data, len);
@@ -148,9 +158,7 @@ void udp_downstream_queue(struct udp_worker *worker,
     while (offset < len) {
         size_t remaining = len - offset;
         size_t full_segments = remaining / gro_segment_size;
-        size_t max_segments = VANE_MIN((size_t)UDP_GSO_MAX_SEGMENTS,
-                                         UDP_GSO_SAFE_BYTES / gro_segment_size);
-        if (max_segments == 0) max_segments = 1;
+        size_t max_segments = udp_gso_segments_per_train(gro_segment_size);
         size_t segments = VANE_MIN(full_segments, max_segments);
         size_t train_len;
         if (segments == 0) {
@@ -300,7 +308,15 @@ bool udp_send_upstream_views(struct udp_flow *flow,
     if (send_upstream_message(flow, iov, iov_count, expected, tclass, has_tclass,
                                   &wire_segment))
         return true;
-    if (!udp_gso_error_disables(errno)) return false;
+    int saved = errno;
+    if (saved == EMSGSIZE) {
+        return send_upstream_views_individual(flow, packets, count, segment_size,
+                                              tclass, has_tclass);
+    }
+    if (!udp_gso_error_disables(saved)) {
+        errno = saved;
+        return false;
+    }
     flow->gso_enabled = false;
     return send_upstream_views_individual(flow, packets, count, segment_size,
                                           tclass, has_tclass);
@@ -355,7 +371,15 @@ bool udp_send_upstream_aggregate(struct udp_flow *flow,
             train_len = remaining;
         if (!send_upstream_train(flow, data + offset, train_len, segment_size,
                                  tclass, has_tclass)) {
-            if (!udp_gso_error_disables(errno)) return false;
+            int saved = errno;
+            if (saved == EMSGSIZE) {
+                return send_upstream_individual(flow, data + offset, remaining,
+                                                segment_size, tclass, has_tclass);
+            }
+            if (!udp_gso_error_disables(saved)) {
+                errno = saved;
+                return false;
+            }
             flow->gso_enabled = false;
             /* Split the entire unsent suffix when offload is disabled. */
             return send_upstream_individual(flow, data + offset, remaining,
@@ -370,7 +394,7 @@ bool udp_forward_upstream(struct udp_worker *worker, size_t id,
                           const uint8_t *data, size_t len,
                           uint8_t tclass, bool has_tclass) {
     struct udp_flow *flow = &worker->flows[id];
-    if (udp_send_upstream_aggregate(flow, data, len, (uint16_t)len,
+    if (udp_send_upstream_aggregate(flow, data, len, 0U,
                                     tclass, has_tclass)) {
         return true;
     }

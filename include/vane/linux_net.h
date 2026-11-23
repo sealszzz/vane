@@ -22,10 +22,14 @@ int vane_socket_create_listener(const struct vane_addr *address,
                                   struct vane_error *err);
 int vane_udp_enable_metadata(int fd, int family, bool enable_gro,
                                struct vane_error *err);
+int vane_udp_enable_connected_metadata(int fd, int family, bool enable_gro,
+                                       struct vane_error *err);
 bool vane_udp_parse_meta(const struct msghdr *msg,
                            const struct vane_addr *bound,
                            struct vane_udp_meta *meta,
                            struct vane_error *err);
+void vane_udp_parse_connected_meta(const struct msghdr *msg,
+                                   struct vane_udp_meta *meta);
 bool vane_udp_set_ancillary(struct msghdr *msg, size_t control_capacity,
                               int family, const struct vane_addr *local,
                               const uint8_t *tclass,

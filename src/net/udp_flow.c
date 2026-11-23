@@ -53,8 +53,12 @@ bool udp_flow_key_equal(const struct udp_flow_key *a,
 }
 
 size_t udp_next_power_of_two(size_t value) {
-    size_t n = 1;
-    while (n < value && n <= SIZE_MAX / 2U) n <<= 1;
+    if (value == 0U) return 1U;
+    size_t n = 1U;
+    while (n < value) {
+        if (n > SIZE_MAX / 2U) return SIZE_MAX;
+        n <<= 1U;
+    }
     return n;
 }
 
@@ -285,12 +289,12 @@ static void udp_flow_manage_capacity(struct udp_worker *worker, uint64_t now) {
 struct udp_flow *udp_flow_insert(struct udp_worker *worker,
                                  const struct udp_flow_key *key,
                                  bool account_probe, size_t *id_out) {
+    if (account_probe && worker->pending_count >= worker->pending_limit)
+        return NULL;
     uint64_t now = vane_monotonic_ms();
     udp_flow_manage_capacity(worker, now);
     if (worker->flow_count >= worker->flow_limit ||
         worker->free_flow_count == 0U)
-        return NULL;
-    if (account_probe && worker->pending_count >= worker->pending_limit)
         return NULL;
     size_t id = (size_t)worker->free_flow_ids[--worker->free_flow_count];
     struct udp_flow *flow = &worker->flows[id];
@@ -367,7 +371,7 @@ static bool open_upstream_socket(struct udp_worker *worker, size_t id,
         return false;
     }
     struct vane_error err = {0};
-    int gro = vane_udp_enable_metadata(fd, family, true, &err);
+    int gro = vane_udp_enable_connected_metadata(fd, family, true, &err);
     if (gro < 0) {
         char target_buf[96];
         LOG_WARN("UDP worker %zu flow=%zu upstream metadata target=%s failed: %s",
@@ -403,7 +407,7 @@ static bool open_upstream_socket(struct udp_worker *worker, size_t id,
         return false;
     }
     struct epoll_event ev = {
-        .events = EPOLLIN | EPOLLET,
+        .events = EPOLLIN,
         .data.u64 = udp_event_token(UDP_EVENT_UPSTREAM, (uint32_t)id,
                                     generation),
     };

@@ -41,7 +41,10 @@ static bool worker_allocate_storage(struct udp_worker *worker) {
     worker->rx_iov = calloc(worker->rx_count, sizeof(*worker->rx_iov));
     worker->rx_peers = calloc(worker->rx_count, sizeof(*worker->rx_peers));
     worker->rx_controls = calloc(worker->rx_count, VANE_UDP_CONTROL_SIZE);
-    worker->rx_storage = malloc(worker->rx_count * UDP_MAX_PACKET);
+    worker->rx_storage = malloc(worker->rx_count * UDP_PACKET_STRIDE);
+    worker->up_rx_msgs = calloc(worker->rx_count, sizeof(*worker->up_rx_msgs));
+    worker->up_rx_iov = calloc(worker->rx_count, sizeof(*worker->up_rx_iov));
+    worker->up_rx_controls = calloc(worker->rx_count, VANE_UDP_CONTROL_SIZE);
 
     worker->down_capacity = worker->args->runtime->send_batch;
     worker->down = calloc(worker->down_capacity, sizeof(*worker->down));
@@ -49,7 +52,7 @@ static bool worker_allocate_storage(struct udp_worker *worker) {
     worker->tx_iov = calloc(worker->down_capacity, sizeof(*worker->tx_iov));
     worker->tx_controls = calloc(worker->down_capacity,
                                  VANE_UDP_CONTROL_SIZE);
-    worker->down_storage = malloc(worker->down_capacity * UDP_MAX_PACKET);
+    worker->down_storage = malloc(worker->down_capacity * UDP_PACKET_STRIDE);
 
     return worker->flows != NULL && worker->flow_index != NULL &&
            worker->free_flow_ids != NULL &&
@@ -57,6 +60,8 @@ static bool worker_allocate_storage(struct udp_worker *worker) {
            worker->free_probe_ids != NULL && worker->rx_msgs != NULL &&
            worker->rx_iov != NULL && worker->rx_peers != NULL &&
            worker->rx_controls != NULL && worker->rx_storage != NULL &&
+           worker->up_rx_msgs != NULL && worker->up_rx_iov != NULL &&
+           worker->up_rx_controls != NULL &&
            worker->down != NULL && worker->tx_msgs != NULL &&
            worker->tx_iov != NULL && worker->tx_controls != NULL &&
            worker->down_storage != NULL;
@@ -68,7 +73,7 @@ static void init_rx_messages(struct udp_worker *worker) {
         struct iovec *iov = &worker->rx_iov[i];
         struct sockaddr_storage *peer = &worker->rx_peers[i];
         unsigned char *control = worker->rx_controls + i * VANE_UDP_CONTROL_SIZE;
-        iov->iov_base = worker->rx_storage + i * UDP_MAX_PACKET;
+        iov->iov_base = worker->rx_storage + i * UDP_PACKET_STRIDE;
         iov->iov_len = UDP_MAX_PACKET;
         mmsg->msg_hdr.msg_name = peer;
         mmsg->msg_hdr.msg_namelen = sizeof(*peer);
@@ -76,6 +81,18 @@ static void init_rx_messages(struct udp_worker *worker) {
         mmsg->msg_hdr.msg_iovlen = 1;
         mmsg->msg_hdr.msg_control = control;
         mmsg->msg_hdr.msg_controllen = VANE_UDP_CONTROL_SIZE;
+
+        struct mmsghdr *ummsg = &worker->up_rx_msgs[i];
+        struct iovec *uiov = &worker->up_rx_iov[i];
+        uiov->iov_base = worker->rx_storage + i * UDP_PACKET_STRIDE;
+        uiov->iov_len = UDP_MAX_PACKET;
+        ummsg->msg_hdr.msg_name = NULL;
+        ummsg->msg_hdr.msg_namelen = 0;
+        ummsg->msg_hdr.msg_iov = uiov;
+        ummsg->msg_hdr.msg_iovlen = 1;
+        ummsg->msg_hdr.msg_control =
+            worker->up_rx_controls + i * VANE_UDP_CONTROL_SIZE;
+        ummsg->msg_hdr.msg_controllen = VANE_UDP_CONTROL_SIZE;
     }
 }
 
@@ -182,6 +199,9 @@ static void worker_destroy(struct udp_worker *worker) {
     free(worker->rx_peers);
     free(worker->rx_controls);
     free(worker->rx_storage);
+    free(worker->up_rx_msgs);
+    free(worker->up_rx_iov);
+    free(worker->up_rx_controls);
     free(worker->down);
     free(worker->tx_msgs);
     free(worker->tx_iov);
@@ -222,6 +242,7 @@ void *vane_udp_worker_main(void *opaque) {
             uint64_t token = events[i].data.u64;
             uint8_t kind = udp_token_kind(token);
             if (kind == UDP_EVENT_PUBLIC) {
+                udp_downstream_flush(&worker);
                 udp_receive_public(&worker);
                 continue;
             }
