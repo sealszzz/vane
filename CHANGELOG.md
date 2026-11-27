@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.9
+
+### UDP / QUIC PMTU fidelity
+
+- Use `IP_PMTUDISC_PROBE` and `IPV6_PMTUDISC_PROBE` on public and upstream
+  UDP sockets, including IPv4-mapped traffic on dual-stack sockets. Probe
+  mode avoids cached path MTU limits for forwarded probes. Use `DO` when
+  the kernel rejects the probe option.
+- Treat `EMSGSIZE` as loss of the oversized datagram and keep the upstream
+  socket even before the first reply. Continue sending queued datagrams
+  after a PMTU drop, including a short final segment from a GRO aggregate.
+- Check socket modes and PMTU error handling in the UDP regression tests.
+
 ## 0.2.8
 
 ### Release integrity fixes

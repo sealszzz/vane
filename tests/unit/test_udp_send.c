@@ -7,7 +7,7 @@
 #include <string.h>
 
 enum send_mode { SEND_OK, GSO_FAIL, PLAIN_FAIL, PARTIAL_BACKPRESSURE,
-                 PARTIAL_GSO_FAIL, UPSTREAM_GSO_FAIL };
+                 PARTIAL_GSO_FAIL, UPSTREAM_GSO_FAIL, UPSTREAM_PMTU_LIMIT };
 static enum send_mode mode;
 static size_t mmsg_calls, msg_calls, delivered;
 static size_t lengths[128];
@@ -60,17 +60,23 @@ int __wrap_sendmmsg(int fd, struct mmsghdr *messages, unsigned int count, int fl
 ssize_t __wrap_sendmsg(int fd, const struct msghdr *message, int flags) {
     VANE_UNUSED(fd); VANE_UNUSED(flags);
     msg_calls++;
-    if (mode == UPSTREAM_GSO_FAIL) {
+    if (mode == UPSTREAM_GSO_FAIL || mode == UPSTREAM_PMTU_LIMIT) {
         struct msghdr header = *message;
-        if (msg_calls == 1U) {
-            assert(message_has_gso(&header));
-            errno = EOPNOTSUPP;
-            return -1;
+        bool gso = message_has_gso(&header);
+        if (mode == UPSTREAM_GSO_FAIL) {
+            assert(gso == (msg_calls == 1U));
+            if (gso) {
+                errno = EOPNOTSUPP;
+                return -1;
+            }
         }
-        assert(!message_has_gso(&header));
         size_t len = 0U;
         for (size_t i = 0; i < message->msg_iovlen; i++)
             len += message->msg_iov[i].iov_len;
+        if (mode == UPSTREAM_PMTU_LIMIT && (gso || len > 1000U)) {
+            errno = EMSGSIZE;
+            return -1;
+        }
         assert(delivered < VANE_ARRAY_LEN(lengths));
         lengths[delivered++] = len;
         return (ssize_t)len;
@@ -128,6 +134,23 @@ static void test_upstream_fallback(struct udp_flow *flow, bool proxy) {
     for (size_t i = 0; i < delivered - 1U; i++)
         assert(lengths[i] == segment + header);
     assert(lengths[delivered - 1U] == 300U + header);
+    flow->target = NULL;
+}
+
+static void test_pmtu_failure_preserves_short_tail(struct udp_flow *flow,
+                                                   bool gso, bool proxy) {
+    struct vane_target_config target = {
+        .location = flow->key.local,
+        .proxy_protocol = proxy,
+    };
+    uint8_t data[2500] = {0};
+    flow->target = &target;
+    flow->gso_enabled = gso;
+    reset_sender(UPSTREAM_PMTU_LIMIT);
+    assert(!udp_send_upstream_aggregate(flow, data, sizeof(data), 1200U, 0U, false));
+    assert(errno == EMSGSIZE && flow->gso_enabled == gso);
+    assert(msg_calls == (gso ? 4U : 3U) && delivered == 1U);
+    assert(lengths[0] == (proxy ? 128U : 100U));
     flow->target = NULL;
 }
 
@@ -198,6 +221,8 @@ int main(void) {
     assert(msg_calls == 0U && worker.down_count == 0U);
     test_upstream_fallback(&flow, false);
     test_upstream_fallback(&flow, true);
+    test_pmtu_failure_preserves_short_tail(&flow, true, false);
+    test_pmtu_failure_preserves_short_tail(&flow, false, true);
     destroy_worker(&worker);
     return 0;
 }

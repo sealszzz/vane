@@ -23,6 +23,18 @@
 #ifndef IOV_MAX
 #define IOV_MAX 1024
 #endif
+#ifndef IP_PMTUDISC_DO
+#define IP_PMTUDISC_DO 2
+#endif
+#ifndef IP_PMTUDISC_PROBE
+#define IP_PMTUDISC_PROBE 3
+#endif
+#ifndef IPV6_PMTUDISC_DO
+#define IPV6_PMTUDISC_DO 2
+#endif
+#ifndef IPV6_PMTUDISC_PROBE
+#define IPV6_PMTUDISC_PROBE 3
+#endif
 
 static bool set_int_opt(int fd, int level, int name, int value,
                         const char *label, struct vane_error *err) {
@@ -31,6 +43,39 @@ static bool set_int_opt(int fd, int level, int name, int value,
         return false;
     }
     return true;
+}
+
+static bool set_pmtu_probe_opt(int fd, int level, int name,
+                               int probe_value, int fallback_value,
+                               const char *label, struct vane_error *err) {
+    if (setsockopt(fd, level, name, &probe_value,
+                   (socklen_t)sizeof(probe_value)) == 0)
+        return true;
+    if (errno == EINVAL || errno == ENOPROTOOPT || errno == EOPNOTSUPP) {
+        if (setsockopt(fd, level, name, &fallback_value,
+                       (socklen_t)sizeof(fallback_value)) == 0)
+            return true;
+    }
+    vane_error_set(err, "%s: %s", label, strerror(errno));
+    return false;
+}
+
+static bool enable_udp_pmtu_probe(int fd, int family, struct vane_error *err) {
+    if (family == AF_INET) {
+        return set_pmtu_probe_opt(fd, IPPROTO_IP, IP_MTU_DISCOVER,
+                                  IP_PMTUDISC_PROBE, IP_PMTUDISC_DO,
+                                  "IP_MTU_DISCOVER", err);
+    }
+    if (family == AF_INET6) {
+        return set_pmtu_probe_opt(fd, IPPROTO_IPV6, IPV6_MTU_DISCOVER,
+                                  IPV6_PMTUDISC_PROBE, IPV6_PMTUDISC_DO,
+                                  "IPV6_MTU_DISCOVER", err) &&
+               set_pmtu_probe_opt(fd, IPPROTO_IP, IP_MTU_DISCOVER,
+                                  IP_PMTUDISC_PROBE, IP_PMTUDISC_DO,
+                                  "IP_MTU_DISCOVER", err);
+    }
+    vane_error_set(err, "unsupported UDP family");
+    return false;
 }
 
 int vane_socket_create_listener(const struct vane_addr *address,
@@ -86,6 +131,7 @@ int vane_udp_enable_metadata(int fd, int family, bool enable_gro,
         vane_error_set(err, "unsupported UDP family");
         return -1;
     }
+    if (!enable_udp_pmtu_probe(fd, family, err)) return -1;
     if (enable_gro && setsockopt(fd, SOL_UDP, UDP_GRO, &one, (socklen_t)sizeof(one)) != 0) {
         if (errno != ENOPROTOOPT && errno != EOPNOTSUPP && errno != EINVAL) {
             vane_error_set(err, "UDP_GRO: %s", strerror(errno));
@@ -108,6 +154,7 @@ int vane_udp_enable_connected_metadata(int fd, int family, bool enable_gro,
         vane_error_set(err, "unsupported UDP family");
         return -1;
     }
+    if (!enable_udp_pmtu_probe(fd, family, err)) return -1;
     if (enable_gro && setsockopt(fd, SOL_UDP, UDP_GRO, &one, (socklen_t)sizeof(one)) != 0) {
         if (errno != ENOPROTOOPT && errno != EOPNOTSUPP && errno != EINVAL) {
             vane_error_set(err, "UDP_GRO: %s", strerror(errno));

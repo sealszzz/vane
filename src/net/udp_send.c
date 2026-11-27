@@ -326,13 +326,18 @@ static bool send_upstream_individual(const struct udp_flow *flow,
                                      const uint8_t *data, size_t len,
                                      uint16_t segment_size,
                                      uint8_t tclass, bool has_tclass) {
+    bool oversized = false;
     for (size_t offset = 0U; offset < len;) {
         size_t n = VANE_MIN((size_t)segment_size, len - offset);
-        if (!send_upstream_datagram(flow, data + offset, n, tclass, has_tclass))
-            return false;
+        if (!send_upstream_datagram(flow, data + offset, n, tclass, has_tclass)) {
+            if (errno != EMSGSIZE) return false;
+            /* A short final GRO segment may still fit the upstream path. */
+            oversized = true;
+        }
         offset += n;
     }
-    return true;
+    if (oversized) errno = EMSGSIZE;
+    return !oversized;
 }
 
 bool udp_send_upstream_aggregate(struct udp_flow *flow,
@@ -405,6 +410,7 @@ bool udp_forward_upstream(struct udp_worker *worker, size_t id,
                   worker->args->worker_index, id, len, strerror(saved));
         return true;
     }
-    (void)udp_flow_handle_io_error(worker, id, "upstream send", saved);
-    return false;
+    bool kept = udp_flow_handle_io_error(worker, id, "upstream send", saved);
+    /* A PMTU drop is local to this datagram. Keep flushing a completed probe. */
+    return saved == EMSGSIZE && kept;
 }

@@ -11,13 +11,21 @@
 
 static struct vane_runtime_config test_runtime;
 static struct vane_worker_args test_args;
+static size_t pmtu_send_limit;
 
 ssize_t __wrap_sendmsg(int fd, const struct msghdr *message, int flags);
 
 ssize_t __wrap_sendmsg(int fd, const struct msghdr *message, int flags) {
     VANE_UNUSED(fd);
-    VANE_UNUSED(message);
     VANE_UNUSED(flags);
+    if (pmtu_send_limit != 0U) {
+        size_t len = 0U;
+        for (size_t i = 0U; i < message->msg_iovlen; i++)
+            len += message->msg_iov[i].iov_len;
+        if (len <= pmtu_send_limit) return (ssize_t)len;
+        errno = EMSGSIZE;
+        return -1;
+    }
     errno = ECONNREFUSED;
     return -1;
 }
@@ -199,6 +207,40 @@ static void test_pressure_reclaims_oldest_before_expanding(void) {
     assert(udp_flow_lookup_id(&worker, &oldest_key) == SIZE_MAX);
     assert(worker.flow_limit == 4U);
     assert(worker.flow_count == 3U);
+    worker_table_destroy(&worker);
+}
+
+static void test_pmtu_error_preserves_new_flow(void) {
+    struct udp_worker worker;
+    worker_table_init(&worker, 4U, 8U, 16U);
+    struct udp_flow_key key = make_key(14001U);
+    struct vane_target_config target = {
+        .location_kind = VANE_LOCATION_ADDRESS,
+        .location = key.local,
+    };
+    size_t id = SIZE_MAX;
+    struct udp_flow *flow = udp_flow_insert(&worker, &key, false, &id);
+    assert(flow != NULL);
+    flow->state = UDP_FLOW_ACTIVE;
+    flow->target = &target;
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    assert(fd >= 0);
+    flow->upstream_fd = fd;
+    assert(!flow->upstream_confirmed);
+
+    const uint8_t datagram[1201] = {0};
+    pmtu_send_limit = sizeof(datagram) - 1U;
+    assert(udp_forward_upstream(&worker, id, datagram, sizeof(datagram), 0U, false));
+    assert(udp_flow_lookup_id(&worker, &key) == id);
+    assert(flow->upstream_fd == fd && flow->state == UDP_FLOW_ACTIVE);
+    assert(flow->last_error == EMSGSIZE && !flow->upstream_confirmed);
+    assert(udp_forward_upstream(&worker, id, datagram, pmtu_send_limit, 0U, false));
+    assert(flow->upstream_fd == fd);
+    pmtu_send_limit = 0U;
+
+    /* A reachability failure keeps the existing unconfirmed-flow policy. */
+    assert(!udp_forward_upstream(&worker, id, datagram, 100U, 0U, false));
+    assert(udp_flow_lookup_id(&worker, &key) == SIZE_MAX);
     worker_table_destroy(&worker);
 }
 
@@ -518,6 +560,7 @@ int main(void) {
     test_backward_shift_deletion();
     test_capacity_expands_and_contracts();
     test_pressure_reclaims_oldest_before_expanding();
+    test_pmtu_error_preserves_new_flow();
     test_hard_idle_removes_confirmed_flow();
     test_reprobe_state_is_reversible();
     test_reprobe_send_error_releases_probe();

@@ -6,7 +6,16 @@
 #include <errno.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <netinet/ip.h>
+#include <netinet/ip6.h>
 #include <unistd.h>
+
+#ifndef IP_PMTUDISC_PROBE
+#define IP_PMTUDISC_PROBE 3
+#endif
+#ifndef IPV6_PMTUDISC_PROBE
+#define IPV6_PMTUDISC_PROBE 3
+#endif
 
 static void bind_loopback4(int fd, struct vane_addr *out) {
     struct sockaddr_in addr = {0};
@@ -130,9 +139,58 @@ static void test_invalid_family(void) {
     close(fd);
 }
 
+static void test_udp_pmtu_probe_options(void) {
+    struct vane_error err = {0};
+    int val = 0;
+    socklen_t len = (socklen_t)sizeof(val);
+
+    int fd4 = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    assert(fd4 >= 0);
+    assert(vane_udp_enable_metadata(fd4, AF_INET, false, &err) == 0);
+    assert(getsockopt(fd4, IPPROTO_IP, IP_MTU_DISCOVER, &val, &len) == 0);
+    assert(val == IP_PMTUDISC_PROBE);
+    close(fd4);
+
+    int fd6 = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    assert(fd6 >= 0);
+    int zero = 0;
+    assert(setsockopt(fd6, IPPROTO_IPV6, IPV6_V6ONLY, &zero, (socklen_t)sizeof(zero)) == 0);
+    memset(&err, 0, sizeof(err));
+    assert(vane_udp_enable_metadata(fd6, AF_INET6, false, &err) == 0);
+    val = 0; len = (socklen_t)sizeof(val);
+    assert(getsockopt(fd6, IPPROTO_IPV6, IPV6_MTU_DISCOVER, &val, &len) == 0);
+    assert(val == IPV6_PMTUDISC_PROBE);
+    val = 0; len = (socklen_t)sizeof(val);
+    assert(getsockopt(fd6, IPPROTO_IP, IP_MTU_DISCOVER, &val, &len) == 0);
+    assert(val == IP_PMTUDISC_PROBE);
+    close(fd6);
+
+    int c4 = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    assert(c4 >= 0);
+    memset(&err, 0, sizeof(err));
+    assert(vane_udp_enable_connected_metadata(c4, AF_INET, false, &err) == 0);
+    val = 0; len = (socklen_t)sizeof(val);
+    assert(getsockopt(c4, IPPROTO_IP, IP_MTU_DISCOVER, &val, &len) == 0);
+    assert(val == IP_PMTUDISC_PROBE);
+    close(c4);
+
+    int c6 = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    assert(c6 >= 0);
+    memset(&err, 0, sizeof(err));
+    assert(vane_udp_enable_connected_metadata(c6, AF_INET6, false, &err) == 0);
+    val = 0; len = (socklen_t)sizeof(val);
+    assert(getsockopt(c6, IPPROTO_IPV6, IPV6_MTU_DISCOVER, &val, &len) == 0);
+    assert(val == IPV6_PMTUDISC_PROBE);
+    val = 0; len = (socklen_t)sizeof(val);
+    assert(getsockopt(c6, IPPROTO_IP, IP_MTU_DISCOVER, &val, &len) == 0);
+    assert(val == IP_PMTUDISC_PROBE);
+    close(c6);
+}
+
 int main(void) {
     test_ipv4_connected_tclass();
     test_dual_stack_ipv4_metadata_roundtrip();
+    test_udp_pmtu_probe_options();
     test_invalid_family();
     return 0;
 }

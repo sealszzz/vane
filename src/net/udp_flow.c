@@ -712,7 +712,6 @@ static bool udp_error_preserves_socket(int error_number) {
         case ETIMEDOUT:
         case EACCES:
         case EPERM:
-        case EMSGSIZE:
         case EPIPE:
             return true;
         default:
@@ -766,7 +765,10 @@ bool udp_flow_handle_io_error(struct udp_worker *worker, size_t id,
         return false;
 
     errno = error_number;
-    if (flow->upstream_confirmed && udp_error_preserves_socket(error_number)) {
+    /* An oversized datagram does not invalidate the connected socket, even
+     * when the upstream has not replied to the first flight yet. */
+    if (error_number == EMSGSIZE ||
+        (flow->upstream_confirmed && udp_error_preserves_socket(error_number))) {
         log_io_error(worker, id, operation, error_number);
         return true;
     }
